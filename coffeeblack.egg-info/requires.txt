@@ -1,7 +1,0 @@
-pyautogui
-aiohttp
-asyncio
-pillow
-numpy
-opencv-python
-mss

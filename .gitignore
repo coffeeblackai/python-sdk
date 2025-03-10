@@ -1,0 +1,50 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+*.egg
+
+# Virtual environments
+venv/
+env/
+ENV/
+.env/
+.venv/
+
+# IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Testing
+.coverage
+htmlcov/
+.pytest_cache/
+.tox/
+
+# Environment variables
+.env
+
+# Documentation builds
+docs/_build/
+site/
+
+# Jupyter Notebooks
+.ipynb_checkpoints
+
+# Local development settings
+local_settings.py
+
+# PyPI credentials
+.pypirc
+
+# Cache directories
+.mypy_cache/
+.ruff_cache/ 
