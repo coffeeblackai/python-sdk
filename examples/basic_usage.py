@@ -1,38 +1,41 @@
 """
-Basic usage example for the CoffeeBlack SDK
+Basic usage example for the Argus SDK
 """
 
 import asyncio
-from coffeeblack import CoffeeBlackSDK
+import os
+import sys
+import os.path
+import time
+from coffeeblack import Argus
 
 async def main():
-    # Initialize the SDK
-    sdk = CoffeeBlackSDK()
+    # Initialize the SDK with API key for authentication
+    # You can provide your API key directly or through an environment variable
+    api_key = os.environ.get("COFFEEBLACK_API_KEY")
+    sdk = Argus(
+        api_key=api_key,  # API key for authentication
+        verbose=True,
+        debug_enabled=True,
+        elements_conf=0.2,
+        rows_conf=0.4,
+        model="ui-detect"  # Set the UI detection model to use (cua, ui-detect, or ui-tars)
+    )
     
-    # Get all open windows
-    windows = await sdk.get_open_windows()
-    print(f"Found {len(windows)} open windows:")
-    for window in windows:
-        print(f"- {window.title} ({window.app_name})")
+    # Define the browser name
+    browser_name = "Safari" 
     
-    # Attach to a window by name (e.g., Chrome, Safari, etc.)
-    browser_name = "Chrome"  # Change this to match your browser
-    print(f"\nAttempting to attach to {browser_name}...")
     try:
-        await sdk.attach_to_window_by_name(browser_name)
-        print(f"Successfully attached to {browser_name}")
+        # Open and attach to the browser, waiting 2 seconds by default
+        # You can adjust the wait time as needed - longer for slower apps, shorter for faster ones
+        await sdk.open_and_attach_to_app(browser_name, wait_time=2.0)
+
+        # Execute an action based on a natural language query
+        print("\nExecuting action based on natural language query...")
+        await sdk.execute_action("Type https://www.google.com into the url bar")
         
-        # Take a screenshot
-        print("Taking a screenshot...")
-        screenshot = await sdk.get_screenshot()
-        print(f"Screenshot taken, size: {len(screenshot)} bytes")
-        
-        # Reason about the UI
-        print("\nReasoning about the UI...")
-        response = await sdk.reason("What elements are visible on the page?")
-        print(f"Response: {response.response}")
-        print(f"Number of elements detected: {response.num_boxes}")
-        
+        await sdk.press_key("enter")
+    
     except Exception as e:
         print(f"Error: {e}")
 

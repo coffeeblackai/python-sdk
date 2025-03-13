@@ -34,6 +34,7 @@ class CoffeeBlackSDK:
     """
     
     def __init__(self, 
+                 api_key: str = None,
                  base_url: str = 'https://app.coffeeblack.ai',
                  use_hierarchical_indexing: bool = False,
                  use_query_rewriting: bool = False,
@@ -42,11 +43,13 @@ class CoffeeBlackSDK:
                  use_embeddings: bool = True,
                  verbose: bool = False,
                  elements_conf: float = 0.4,
-                 rows_conf: float = 0.3):
+                 rows_conf: float = 0.3,
+                 model: str = "ui-tars"):
         """
         Initialize the CoffeeBlack SDK.
         
         Args:
+            api_key: API key for authentication with the CoffeeBlack API
             base_url: API base URL for CoffeeBlack service
             use_hierarchical_indexing: Whether to use hierarchical indexing for element selection
             use_query_rewriting: Whether to use query rewriting to enhance natural language understanding
@@ -56,7 +59,9 @@ class CoffeeBlackSDK:
             verbose: Whether to show verbose output during operations
             elements_conf: Confidence threshold for UI element detection (0.0-1.0)
             rows_conf: Confidence threshold for UI row detection (0.0-1.0)
+            model: UI detection model to use ("cua", "ui-detect", or "ui-tars")
         """
+        self.api_key = api_key
         self.base_url = base_url
         self.use_hierarchical_indexing = use_hierarchical_indexing
         self.use_query_rewriting = use_query_rewriting
@@ -70,8 +75,14 @@ class CoffeeBlackSDK:
         if not 0.0 <= rows_conf <= 1.0:
             raise ValueError("rows_conf must be between 0.0 and 1.0")
             
+        # Validate model selection
+        valid_models = ["cua", "ui-detect", "ui-tars"]
+        if model not in valid_models:
+            raise ValueError(f"Model must be one of: {', '.join(valid_models)}")
+            
         self.elements_conf = elements_conf
         self.rows_conf = rows_conf
+        self.model = model
         
         # Suppress verbose output if not explicitly enabled
         if not verbose:
@@ -178,6 +189,47 @@ class CoffeeBlackSDK:
         """
         success, message = self.app_manager.open_app(query)
         return success, message
+    
+    async def open_and_attach_to_app(self, app_name: str, wait_time: float = 2.0) -> None:
+        """
+        Open an app with the specified name, wait for it to launch, and then attach to it.
+        
+        Args:
+            app_name: Name of the application to open
+            wait_time: Time to wait in seconds for the app to launch before attaching
+            
+        Raises:
+            ValueError: If the app couldn't be found or opened
+            ValueError: If no window matching the app name could be found after waiting
+        """
+        logger.info(f"Opening and attaching to {app_name}...")
+        
+        # Open the app
+        success, message = await self.open_app(app_name)
+        if not success:
+            raise ValueError(f"Failed to open {app_name}: {message}")
+        
+        # Wait for the specified time to allow the app to launch
+        logger.info(f"Waiting {wait_time} seconds for {app_name} to launch...")
+        await asyncio.sleep(wait_time)
+        
+        # Try to attach to the window
+        try:
+            # Format the window name as "window_name - app_name"
+            # First try with exact app name
+            window_query = f"{app_name}"
+            await self.attach_to_window_by_name(window_query)
+            logger.info(f"Successfully attached to {window_query}")
+        except ValueError:
+            # If that fails, try with just the app name (more permissive)
+            try:
+                await self.attach_to_window_by_name(app_name)
+                logger.info(f"Successfully attached to {app_name}")
+            except ValueError:
+                # If that also fails, get all open windows and try to find a match
+                open_windows = await self.get_open_windows()
+                logger.info(f"Available windows: {[w.title for w in open_windows]}")
+                raise ValueError(f"Could not find a window matching '{app_name}' after waiting {wait_time} seconds")
     
     def is_app_installed(self, app_name: str) -> bool:
         """
@@ -287,14 +339,22 @@ class CoffeeBlackSDK:
                     data.add_field('element_conf', str(elements_conf))
                     data.add_field('row_conf', str(rows_conf))
                     
+                    # Add the model parameter
+                    data.add_field('model', self.model)
+                    
                     # Add additional options if using experimental features
                     if self.use_hierarchical_indexing:
                         data.add_field('use_hierarchical_indexing', 'true')
                     if self.use_query_rewriting:
                         data.add_field('use_query_rewriting', 'true')
                     
+                    # Create headers with Authorization if API key is provided
+                    headers = {}
+                    if self.api_key:
+                        headers['Authorization'] = f'Bearer {self.api_key}'
+                    
                     # Send request
-                    async with session.post(url, data=data) as response:
+                    async with session.post(url, data=data, headers=headers) as response:
                         if response.status != 200:
                             error_text = await response.text()
                             raise RuntimeError(f"API request failed with status {response.status}: {error_text}")
@@ -672,14 +732,22 @@ class CoffeeBlackSDK:
                     # Disable action execution
                     data.add_field('execute_action', 'false')
                     
+                    # Add the model parameter
+                    data.add_field('model', self.model)
+                    
                     # Add additional options if using experimental features
                     if self.use_hierarchical_indexing:
                         data.add_field('use_hierarchical_indexing', 'true')
                     if self.use_query_rewriting:
                         data.add_field('use_query_rewriting', 'true')
                     
+                    # Create headers with Authorization if API key is provided
+                    headers = {}
+                    if self.api_key:
+                        headers['Authorization'] = f'Bearer {self.api_key}'
+                    
                     # Send request
-                    async with session.post(url, data=data) as response:
+                    async with session.post(url, data=data, headers=headers) as response:
                         if response.status != 200:
                             error_text = await response.text()
                             raise RuntimeError(f"API request failed with status {response.status}: {error_text}")

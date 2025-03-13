@@ -48,3 +48,5 @@ local_settings.py
 # Cache directories
 .mypy_cache/
 .ruff_cache/ 
+
+debug/
