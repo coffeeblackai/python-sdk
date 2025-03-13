@@ -10,7 +10,7 @@ import pyautogui
 import asyncio
 import aiohttp
 import traceback
-from typing import List, Dict, Optional, Any, Tuple
+from typing import List, Dict, Optional, Any, Tuple, Callable, TypeVar, Union
 
 from .types import WindowInfo, Action, CoffeeBlackResponse
 from .utils import debug, window, screenshot
@@ -44,7 +44,9 @@ class CoffeeBlackSDK:
                  verbose: bool = False,
                  elements_conf: float = 0.4,
                  rows_conf: float = 0.3,
-                 model: str = "ui-tars"):
+                 model: str = "ui-tars",
+                 max_retries: int = 2,  # Added max_retries parameter with default value of 2
+                 retry_backoff: float = 0.5):  # Added retry_backoff parameter
         """
         Initialize the CoffeeBlack SDK.
         
@@ -60,6 +62,8 @@ class CoffeeBlackSDK:
             elements_conf: Confidence threshold for UI element detection (0.0-1.0)
             rows_conf: Confidence threshold for UI row detection (0.0-1.0)
             model: UI detection model to use ("cua", "ui-detect", or "ui-tars")
+            max_retries: Maximum number of retries for transient errors
+            retry_backoff: Backoff time between retries in seconds
         """
         self.api_key = api_key
         self.base_url = base_url
@@ -116,6 +120,10 @@ class CoffeeBlackSDK:
             
         # Initialize app manager for app discovery and launching
         self.app_manager = AppManager(use_embeddings=use_embeddings, verbose=verbose)
+        
+        # Retry settings
+        self.max_retries = max_retries
+        self.retry_backoff = retry_backoff
     
     async def get_open_windows(self) -> List[WindowInfo]:
         """
@@ -267,7 +275,8 @@ class CoffeeBlackSDK:
     async def execute_action(self, 
                            query: str, 
                            elements_conf: Optional[float] = None, 
-                           rows_conf: Optional[float] = None) -> CoffeeBlackResponse:
+                           rows_conf: Optional[float] = None,
+                           model: Optional[str] = None) -> CoffeeBlackResponse:
         """
         Execute a natural language query on the API and optionally execute the chosen action.
         
@@ -275,12 +284,14 @@ class CoffeeBlackSDK:
             query: Natural language query
             elements_conf: Optional override for element detection confidence (0.0-1.0)
             rows_conf: Optional override for row detection confidence (0.0-1.0)
+            model: Optional override for UI detection model ("cua", "ui-detect", or "ui-tars")
             
         Returns:
             CoffeeBlackResponse with the API response
             
         Raises:
             ValueError: If no active window is attached
+            ValueError: If invalid model is specified
             RuntimeError: If the API request fails
         """
         # Check if we have an active window
@@ -290,6 +301,14 @@ class CoffeeBlackSDK:
         # Use default confidence values if not provided
         elements_conf = elements_conf if elements_conf is not None else self.elements_conf
         rows_conf = rows_conf if rows_conf is not None else self.rows_conf
+        
+        # Use default model if not provided
+        selected_model = model if model is not None else self.model
+        
+        # Validate model selection if provided
+        valid_models = ["cua", "ui-detect", "ui-tars"]
+        if selected_model not in valid_models:
+            raise ValueError(f"Model must be one of: {', '.join(valid_models)}")
         
         # Validate confidence thresholds
         if not 0.0 <= elements_conf <= 1.0:
@@ -316,13 +335,13 @@ class CoffeeBlackSDK:
         try:
             # Log request details
             if self.debug_enabled:
-                timestamp = int(time.time())
                 request_debug = {
                     'url': url,
                     'query': query,
                     'screenshot': os.path.basename(screenshot_path),
                     'elements_conf': elements_conf,
                     'rows_conf': rows_conf,
+                    'model': selected_model,
                     'timestamp': timestamp
                 }
                 debug.log_debug(self.debug_dir, "0", request_debug, "request")
@@ -340,7 +359,7 @@ class CoffeeBlackSDK:
                     data.add_field('row_conf', str(rows_conf))
                     
                     # Add the model parameter
-                    data.add_field('model', self.model)
+                    data.add_field('model', selected_model)
                     
                     # Add additional options if using experimental features
                     if self.use_hierarchical_indexing:
@@ -353,291 +372,290 @@ class CoffeeBlackSDK:
                     if self.api_key:
                         headers['Authorization'] = f'Bearer {self.api_key}'
                     
-                    # Send request
-                    async with session.post(url, data=data, headers=headers) as response:
-                        if response.status != 200:
-                            error_text = await response.text()
-                            raise RuntimeError(f"API request failed with status {response.status}: {error_text}")
-                        
-                        # Get the raw response text
-                        response_text = await response.text()
-                        
-                        # Log raw response
-                        if self.debug_enabled:
-                            with open(f'{self.debug_dir}/response_raw_{timestamp}.txt', 'w') as f:
-                                f.write(response_text)
-                        
-                        # Parse response
-                        try:
-                            result = json.loads(response_text)
-                        except json.JSONDecodeError:
-                            raise RuntimeError(f"Failed to parse response as JSON. Response saved to {self.debug_dir}/response_raw_{timestamp}.txt")
-                        
-                        # Remove fields not in our CoffeeBlackResponse type
-                        if 'annotated_screenshot' in result:
-                            del result['annotated_screenshot']
-                        if 'query' in result:
-                            del result['query']
-                        
-                        # Log parsed response
-                        if self.debug_enabled:
-                            with open(f'{self.debug_dir}/response_{timestamp}.json', 'w') as f:
-                                json.dump(result, f, indent=2)
-                        
-                        # Create debug visualization
-                        debug_viz_path = ""
-                        if self.debug_enabled and 'boxes' in result and screenshot_path:
-                            debug_viz_path = debug.create_debug_visualization(
-                                self.debug_dir,
-                                screenshot_path,
-                                result['boxes'],
-                                result.get('chosen_element_index', -1),
-                                timestamp
-                            )
-                            if debug_viz_path:
-                                print(f"Debug visualization saved to: {debug_viz_path}")
-                        
-                        # Process results and find best element
-                        response = CoffeeBlackResponse(
-                            response=response_text,
-                            boxes=result.get("boxes", []),
-                            raw_detections=result.get("raw_detections", {}),
-                            hierarchy=result.get("hierarchy", {}),
-                            num_boxes=len(result.get("boxes", [])),
-                            chosen_action=Action(**result.get("chosen_action", {})) if result.get("chosen_action") else None,
-                            chosen_element_index=result.get("chosen_element_index"),
-                            explanation=result.get("explanation", ""),
-                            timings=result.get("timings")
+                    # Use the retry utility method
+                    success, response_text, error_message = await self._make_api_request_with_retry(
+                        session=session,
+                        url=url,
+                        data=data,
+                        headers=headers,
+                        debug_prefix="execute",
+                        timestamp=timestamp
+                    )
+                    
+                    if not success:
+                        raise RuntimeError(f"Failed to execute action: {error_message}")
+                    
+                    # Parse response
+                    try:
+                        result = json.loads(response_text)
+                    except json.JSONDecodeError:
+                        raise RuntimeError(f"Failed to parse response as JSON. Response saved to {self.debug_dir}/response_raw_{timestamp}.txt")
+                    
+                    # Remove fields not in our CoffeeBlackResponse type
+                    if 'annotated_screenshot' in result:
+                        del result['annotated_screenshot']
+                    if 'query' in result:
+                        del result['query']
+                    
+                    # Log parsed response
+                    if self.debug_enabled:
+                        with open(f'{self.debug_dir}/response_{timestamp}.json', 'w') as f:
+                            json.dump(result, f, indent=2)
+                    
+                    # Create debug visualization
+                    debug_viz_path = ""
+                    if self.debug_enabled and 'boxes' in result and screenshot_path:
+                        debug_viz_path = debug.create_debug_visualization(
+                            self.debug_dir,
+                            screenshot_path,
+                            result['boxes'],
+                            result.get('chosen_element_index', -1),
+                            timestamp
                         )
-                        
-                        # Execute the action
-                        if response.chosen_action and response.chosen_element_index is not None and response.chosen_element_index >= 0:
-                            try:
-                                chosen_box = response.boxes[response.chosen_element_index]
-                                action = response.chosen_action
-                                
-                                # Calculate absolute coordinates based on window position
-                                bounds = self.active_window.bounds
-                                window_x = bounds['x']
-                                window_y = bounds['y']
-                                
-                                # Get center of the element using bbox
-                                bbox = chosen_box["bbox"]
-                                
-                                # Log basic debug info before calculations
-                                print(f"\nDebug coordinate calculation:")
-                                print(f"Window position: ({window_x}, {window_y})")
-                                print(f"Window dimensions: {bounds['width']}x{bounds['height']}")
-                                print(f"Original bbox: x1={bbox['x1']}, y1={bbox['y1']}, x2={bbox['x2']}, y2={bbox['y2']}")
-                                
-                                # Detect the DPI scaling for the specific monitor this window is on
-                                display_dpi = screenshot.detect_retina_dpi(target_bounds=bounds)
-                                print(f"Detected DPI for window's display: {display_dpi}")
-                                
-                                # Update the stored retina_dpi value
-                                if abs(self.retina_dpi - display_dpi) > 0.1:
-                                    print(f"Updating DPI from {self.retina_dpi} to {display_dpi}")
-                                    self.retina_dpi = display_dpi
-                                
-                                # Get information about displays if we're on macOS
-                                system = platform.system()
-                                displays = []
-                                if system == 'Darwin':
-                                    try:
-                                        displays = screenshot.get_display_info_macos()
-                                        print(f"Found {len(displays)} displays:")
-                                        for i, display in enumerate(displays):
-                                            print(f"  Display {i+1}: {display['bounds']['width']}x{display['bounds']['height']} " +
-                                                f"at ({display['bounds']['x']}, {display['bounds']['y']}) " +
-                                                f"scale: {display['scale_factor']}" +
-                                                f"{' (main)' if display['is_main'] else ''}")
-                                    except Exception as e:
-                                        print(f"Error getting display info: {e}")
-                                        displays = []
-                                
-                                # Calculate element dimensions and center point with improved multi-monitor awareness
-                                if system == 'Darwin':  # Always use scaling logic on macOS
-                                    try:
-                                        # Determine scaling factor to use
-                                        scaling_factor = self.retina_dpi
-                                        primary_display = None
+                        if debug_viz_path:
+                            print(f"Debug visualization saved to: {debug_viz_path}")
+                    
+                    # Process results and find best element
+                    response = CoffeeBlackResponse(
+                        response=response_text,
+                        boxes=result.get("boxes", []),
+                        raw_detections=result.get("raw_detections", {}),
+                        hierarchy=result.get("hierarchy", {}),
+                        num_boxes=len(result.get("boxes", [])),
+                        chosen_action=Action(**result.get("chosen_action", {})) if result.get("chosen_action") else None,
+                        chosen_element_index=result.get("chosen_element_index"),
+                        explanation=result.get("explanation", ""),
+                        timings=result.get("timings")
+                    )
+                    
+                    # Execute the action
+                    if response.chosen_action and response.chosen_element_index is not None and response.chosen_element_index >= 0:
+                        try:
+                            chosen_box = response.boxes[response.chosen_element_index]
+                            action = response.chosen_action
+                            
+                            # Calculate absolute coordinates based on window position
+                            bounds = self.active_window.bounds
+                            window_x = bounds['x']
+                            window_y = bounds['y']
+                            
+                            # Get center of the element using bbox
+                            bbox = chosen_box["bbox"]
+                            
+                            # Log basic debug info before calculations
+                            print(f"\nDebug coordinate calculation:")
+                            print(f"Window position: ({window_x}, {window_y})")
+                            print(f"Window dimensions: {bounds['width']}x{bounds['height']}")
+                            print(f"Original bbox: x1={bbox['x1']}, y1={bbox['y1']}, x2={bbox['x2']}, y2={bbox['y2']}")
+                            
+                            # Detect the DPI scaling for the specific monitor this window is on
+                            display_dpi = screenshot.detect_retina_dpi(target_bounds=bounds)
+                            print(f"Detected DPI for window's display: {display_dpi}")
+                            
+                            # Update the stored retina_dpi value
+                            if abs(self.retina_dpi - display_dpi) > 0.1:
+                                print(f"Updating DPI from {self.retina_dpi} to {display_dpi}")
+                                self.retina_dpi = display_dpi
+                            
+                            # Get information about displays if we're on macOS
+                            system = platform.system()
+                            displays = []
+                            if system == 'Darwin':
+                                try:
+                                    displays = screenshot.get_display_info_macos()
+                                    print(f"Found {len(displays)} displays:")
+                                    for i, display in enumerate(displays):
+                                        print(f"  Display {i+1}: {display['bounds']['width']}x{display['bounds']['height']} " +
+                                            f"at ({display['bounds']['x']}, {display['bounds']['y']}) " +
+                                            f"scale: {display['scale_factor']}" +
+                                            f"{' (main)' if display['is_main'] else ''}")
+                                except Exception as e:
+                                    print(f"Error getting display info: {e}")
+                                    displays = []
+                            
+                            # Calculate element dimensions and center point with improved multi-monitor awareness
+                            if system == 'Darwin':  # Always use scaling logic on macOS
+                                try:
+                                    # Determine scaling factor to use
+                                    scaling_factor = self.retina_dpi
+                                    primary_display = None
+                                    
+                                    # Identify primary display for the window
+                                    if len(displays) > 0:
+                                        # Check if window bounds overlap with any display
+                                        window_rect = {
+                                            'left': bounds['x'],
+                                            'top': bounds['y'],
+                                            'right': bounds['x'] + bounds['width'],
+                                            'bottom': bounds['y'] + bounds['height']
+                                        }
                                         
-                                        # Identify primary display for the window
-                                        if len(displays) > 0:
-                                            # Check if window bounds overlap with any display
-                                            window_rect = {
-                                                'left': bounds['x'],
-                                                'top': bounds['y'],
-                                                'right': bounds['x'] + bounds['width'],
-                                                'bottom': bounds['y'] + bounds['height']
+                                        max_overlap_area = 0
+                                        for display in displays:
+                                            display_rect = {
+                                                'left': display['bounds']['x'],
+                                                'top': display['bounds']['y'],
+                                                'right': display['bounds']['x'] + display['bounds']['width'],
+                                                'bottom': display['bounds']['y'] + display['bounds']['height']
                                             }
                                             
-                                            max_overlap_area = 0
-                                            for display in displays:
-                                                display_rect = {
-                                                    'left': display['bounds']['x'],
-                                                    'top': display['bounds']['y'],
-                                                    'right': display['bounds']['x'] + display['bounds']['width'],
-                                                    'bottom': display['bounds']['y'] + display['bounds']['height']
-                                                }
-                                                
-                                                # Calculate overlap
-                                                overlap_left = max(window_rect['left'], display_rect['left'])
-                                                overlap_top = max(window_rect['top'], display_rect['top'])
-                                                overlap_right = min(window_rect['right'], display_rect['right'])
-                                                overlap_bottom = min(window_rect['bottom'], display_rect['bottom'])
-                                                
-                                                if overlap_left < overlap_right and overlap_top < overlap_bottom:
-                                                    overlap_area = (overlap_right - overlap_left) * (overlap_bottom - overlap_top)
-                                                    if overlap_area > max_overlap_area:
-                                                        max_overlap_area = overlap_area
-                                                        primary_display = display
-                                                        
-                                            if primary_display:
-                                                print(f"Window primarily on display at ({primary_display['bounds']['x']}, {primary_display['bounds']['y']})")
-                                                print(f"Display scale factor: {primary_display['scale_factor']}")
-                                                # Use the display's scaling factor
-                                                scaling_factor = primary_display['scale_factor']
-                                            else:
-                                                print("Couldn't match window to a specific display, using default scaling")
-                                        
-                                        # For standalone MacBook Retina displays, we need different logic
-                                        is_standalone_macbook = (len(displays) == 1 and 
-                                                                displays[0]['scale_factor'] > 1.0 and
-                                                                displays[0]['is_main'])
-                                        
-                                        # External monitor detection - check for common non-Retina resolutions
-                                        is_standard_monitor = False
-                                        for display in displays:
-                                            # Check for common monitor resolutions (1080p, 1440p, etc)
-                                            if (display['bounds']['width'] in [1920, 2560, 3840] and
-                                                display['bounds']['height'] in [1080, 1440, 2160]):
-                                                print(f"Detected standard external monitor: {display['bounds']['width']}x{display['bounds']['height']}")
-                                                is_standard_monitor = True
-                                                # Override the scaling factor for standard monitors
-                                                scaling_factor = 1.0
-                                                break
-                                        
-                                        if is_standard_monitor:
-                                            print("Using standard monitor scaling (1.0)")
-                                            element_width = int(bbox['x2'] - bbox['x1'])
-                                            element_height = int(bbox['y2'] - bbox['y1'])
-                                            element_x = int(window_x + bbox['x1'] + (element_width / 2))
-                                            element_y = int(window_y + bbox['y1'] + (element_height / 2))
-                                        elif is_standalone_macbook:
-                                            print("Detected standalone MacBook with Retina display")
+                                            # Calculate overlap
+                                            overlap_left = max(window_rect['left'], display_rect['left'])
+                                            overlap_top = max(window_rect['top'], display_rect['top'])
+                                            overlap_right = min(window_rect['right'], display_rect['right'])
+                                            overlap_bottom = min(window_rect['bottom'], display_rect['bottom'])
                                             
-                                            # For standalone MacBook, we need to handle UI coordinates differently
-                                            # First check if this window might be a system-level UI element
-                                            is_system_ui = (bounds['width'] < 100 and bounds['height'] < 100) or bounds['y'] < 50
-                                            
-                                            # System UI elements like menu bar don't need scaling adjustment
-                                            if is_system_ui:
-                                                print("Detected system UI element, using direct coordinates")
-                                                element_width = int(bbox['x2'] - bbox['x1'])
-                                                element_height = int(bbox['y2'] - bbox['y1'])
-                                                element_x = int(window_x + bbox['x1'] + (element_width / 2))
-                                                element_y = int(window_y + bbox['y1'] + (element_height / 2))
-                                            else:
-                                                # Regular app window on Retina display
-                                                element_width = int((bbox['x2'] - bbox['x1']) / scaling_factor)
-                                                element_height = int((bbox['y2'] - bbox['y1']) / scaling_factor)
-                                                element_x = int(window_x + (bbox['x1'] / scaling_factor) + (element_width / 2))
-                                                element_y = int(window_y + (bbox['y1'] / scaling_factor) + (element_height / 2))
+                                            if overlap_left < overlap_right and overlap_top < overlap_bottom:
+                                                overlap_area = (overlap_right - overlap_left) * (overlap_bottom - overlap_top)
+                                                if overlap_area > max_overlap_area:
+                                                    max_overlap_area = overlap_area
+                                                    primary_display = display
+                                                    
+                                        if primary_display:
+                                            print(f"Window primarily on display at ({primary_display['bounds']['x']}, {primary_display['bounds']['y']})")
+                                            print(f"Display scale factor: {primary_display['scale_factor']}")
+                                            # Use the display's scaling factor
+                                            scaling_factor = primary_display['scale_factor']
                                         else:
-                                            # Multi-monitor or non-Retina setup
-                                            element_width = int((bbox['x2'] - bbox['x1']) / scaling_factor)
-                                            element_height = int((bbox['y2'] - bbox['y1']) / scaling_factor)
-                                            element_x = int(window_x + (bbox['x1'] / scaling_factor) + (element_width / 2))
-                                            element_y = int(window_y + (bbox['y1'] / scaling_factor) + (element_height / 2))
-                                        
-                                        print(f"Adjusted for display scaling: width={element_width}, height={element_height}")
-                                        print(f"Scaling factor used: {scaling_factor}")
-                                    except Exception as e:
-                                        print(f"Error calculating coordinates with multi-monitor awareness: {e}")
-                                        # Fall back to basic calculation
+                                            print("Couldn't match window to a specific display, using default scaling")
+                                    
+                                    # For standalone MacBook Retina displays, we need different logic
+                                    is_standalone_macbook = (len(displays) == 1 and 
+                                                            displays[0]['scale_factor'] > 1.0 and
+                                                            displays[0]['is_main'])
+                                    
+                                    # External monitor detection - check for common non-Retina resolutions
+                                    is_standard_monitor = False
+                                    for display in displays:
+                                        # Check for common monitor resolutions (1080p, 1440p, etc)
+                                        if (display['bounds']['width'] in [1920, 2560, 3840] and
+                                            display['bounds']['height'] in [1080, 1440, 2160]):
+                                            print(f"Detected standard external monitor: {display['bounds']['width']}x{display['bounds']['height']}")
+                                            is_standard_monitor = True
+                                            # Override the scaling factor for standard monitors
+                                            scaling_factor = 1.0
+                                            break
+                                    
+                                    if is_standard_monitor:
+                                        print("Using standard monitor scaling (1.0)")
                                         element_width = int(bbox['x2'] - bbox['x1'])
                                         element_height = int(bbox['y2'] - bbox['y1'])
                                         element_x = int(window_x + bbox['x1'] + (element_width / 2))
                                         element_y = int(window_y + bbox['y1'] + (element_height / 2))
-                                else:
-                                    # Non-macOS - basic calculation
+                                    elif is_standalone_macbook:
+                                        print("Detected standalone MacBook with Retina display")
+                                        
+                                        # For standalone MacBook, we need to handle UI coordinates differently
+                                        # First check if this window might be a system-level UI element
+                                        is_system_ui = (bounds['width'] < 100 and bounds['height'] < 100) or bounds['y'] < 50
+                                        
+                                        # System UI elements like menu bar don't need scaling adjustment
+                                        if is_system_ui:
+                                            print("Detected system UI element, using direct coordinates")
+                                            element_width = int(bbox['x2'] - bbox['x1'])
+                                            element_height = int(bbox['y2'] - bbox['y1'])
+                                            element_x = int(window_x + bbox['x1'] + (element_width / 2))
+                                            element_y = int(window_y + bbox['y1'] + (element_height / 2))
+                                        else:
+                                            # Regular app window on Retina display
+                                            element_width = int((bbox['x2'] - bbox['x1']) / scaling_factor)
+                                            element_height = int((bbox['y2'] - bbox['y1']) / scaling_factor)
+                                            element_x = int(window_x + (bbox['x1'] / scaling_factor) + (element_width / 2))
+                                            element_y = int(window_y + (bbox['y1'] / scaling_factor) + (element_height / 2))
+                                    else:
+                                        # Multi-monitor or non-Retina setup
+                                        element_width = int((bbox['x2'] - bbox['x1']) / scaling_factor)
+                                        element_height = int((bbox['y2'] - bbox['y1']) / scaling_factor)
+                                        element_x = int(window_x + (bbox['x1'] / scaling_factor) + (element_width / 2))
+                                        element_y = int(window_y + (bbox['y1'] / scaling_factor) + (element_height / 2))
+                                    
+                                    print(f"Adjusted for display scaling: width={element_width}, height={element_height}")
+                                    print(f"Scaling factor used: {scaling_factor}")
+                                except Exception as e:
+                                    print(f"Error calculating coordinates with multi-monitor awareness: {e}")
+                                    # Fall back to basic calculation
                                     element_width = int(bbox['x2'] - bbox['x1'])
                                     element_height = int(bbox['y2'] - bbox['y1'])
                                     element_x = int(window_x + bbox['x1'] + (element_width / 2))
                                     element_y = int(window_y + bbox['y1'] + (element_height / 2))
+                            else:
+                                # Non-macOS - basic calculation
+                                element_width = int(bbox['x2'] - bbox['x1'])
+                                element_height = int(bbox['y2'] - bbox['y1'])
+                                element_x = int(window_x + bbox['x1'] + (element_width / 2))
+                                element_y = int(window_y + bbox['y1'] + (element_height / 2))
+                            
+                            # Log calculated coordinates
+                            print(f"Calculated target: ({element_x}, {element_y})")
+                            print(f"PyAutoGUI screen size: {pyautogui.size()}")
+                            
+                            # Round final coordinates to integers
+                            element_x = int(element_x)
+                            element_y = int(element_y)
+                            
+                            # Log action details
+                            if self.debug_enabled:
+                                action_debug = {
+                                    'action_type': action.action,
+                                    'coordinates': {
+                                        'window_x': window_x,
+                                        'window_y': window_y,
+                                        'element_x': element_x,
+                                        'element_y': element_y,
+                                        'element_width': element_width,
+                                        'element_height': element_height,
+                                        'bbox': {
+                                            'x1': bbox['x1'],
+                                            'y1': bbox['y1'],
+                                            'x2': bbox['x2'],
+                                            'y2': bbox['y2']
+                                        }
+                                    },
+                                    'retina_dpi': self.retina_dpi,
+                                    'timestamp': timestamp
+                                }
+                                with open(f'{self.debug_dir}/action_{timestamp}.json', 'w') as f:
+                                    json.dump(action_debug, f, indent=2)
+                            
+                            # Execute the appropriate action
+                            if action.action == "click":
+                                # Move to position and click
+                                print(f"Executing click at ({element_x}, {element_y})")
+                                pyautogui.moveTo(element_x, element_y, duration=0.2)
+                                pyautogui.click()
                                 
-                                # Log calculated coordinates
-                                print(f"Calculated target: ({element_x}, {element_y})")
-                                print(f"PyAutoGUI screen size: {pyautogui.size()}")
+                            elif action.action == "type" and action.input_text:
+                                # Move to position, click to focus, and type
+                                print(f"Clicking at ({element_x}, {element_y}) and typing: {action.input_text}")
+                                pyautogui.moveTo(element_x, element_y, duration=0.2)
+                                pyautogui.click()
+                                time.sleep(1.0)  # Wait for focus
+                                pyautogui.write(action.input_text)
                                 
-                                # Round final coordinates to integers
-                                element_x = int(element_x)
-                                element_y = int(element_y)
+                            elif action.action == "scroll" and action.scroll_direction:
+                                # Move to position and scroll
+                                print(f"Scrolling {action.scroll_direction} at ({element_x}, {element_y})")
+                                pyautogui.moveTo(element_x, element_y, duration=0.2)
+                                scroll_amount = 100 if action.scroll_direction == "down" else -100
+                                pyautogui.scroll(scroll_amount)
                                 
-                                # Log action details
-                                if self.debug_enabled:
-                                    action_debug = {
-                                        'action_type': action.action,
-                                        'coordinates': {
-                                            'window_x': window_x,
-                                            'window_y': window_y,
-                                            'element_x': element_x,
-                                            'element_y': element_y,
-                                            'element_width': element_width,
-                                            'element_height': element_height,
-                                            'bbox': {
-                                                'x1': bbox['x1'],
-                                                'y1': bbox['y1'],
-                                                'x2': bbox['x2'],
-                                                'y2': bbox['y2']
-                                            }
-                                        },
-                                        'retina_dpi': self.retina_dpi,
-                                        'timestamp': timestamp
-                                    }
-                                    with open(f'{self.debug_dir}/action_{timestamp}.json', 'w') as f:
-                                        json.dump(action_debug, f, indent=2)
+                            elif action.action == "key" and action.key_command:
+                                # Execute a keyboard command
+                                print(f"Pressing key: {action.key_command}")
+                                pyautogui.press(action.key_command)
                                 
-                                # Execute the appropriate action
-                                if action.action == "click":
-                                    # Move to position and click
-                                    print(f"Executing click at ({element_x}, {element_y})")
-                                    pyautogui.moveTo(element_x, element_y, duration=0.2)
-                                    pyautogui.click()
-                                    
-                                elif action.action == "type" and action.input_text:
-                                    # Move to position, click to focus, and type
-                                    print(f"Clicking at ({element_x}, {element_y}) and typing: {action.input_text}")
-                                    pyautogui.moveTo(element_x, element_y, duration=0.2)
-                                    pyautogui.click()
-                                    time.sleep(1.0)  # Wait for focus
-                                    pyautogui.write(action.input_text)
-                                    
-                                elif action.action == "scroll" and action.scroll_direction:
-                                    # Move to position and scroll
-                                    print(f"Scrolling {action.scroll_direction} at ({element_x}, {element_y})")
-                                    pyautogui.moveTo(element_x, element_y, duration=0.2)
-                                    scroll_amount = 100 if action.scroll_direction == "down" else -100
-                                    pyautogui.scroll(scroll_amount)
+                            elif action.action == "no_action":
+                                # No action required
+                                print("No action required")
                                 
-                                elif action.action == "key" and action.key_command:
-                                    # Execute a keyboard command
-                                    print(f"Pressing key: {action.key_command}")
-                                    pyautogui.press(action.key_command)
+                            else:
+                                print(f"Unsupported action: {action.action}")
                                 
-                                elif action.action == "no_action":
-                                    # No action required
-                                    print("No action required")
-                                
-                                else:
-                                    print(f"Unsupported action: {action.action}")
-                                    
-                            except Exception as e:
-                                raise RuntimeError(f"Failed to execute action: {e}")
-                        
-                        return response
-                        
+                        except Exception as e:
+                            raise RuntimeError(f"Failed to execute action: {e}")
+                    
+                    return response
+                    
         except Exception as e:
             raise RuntimeError(f"Failed to execute action: {e}")
 
@@ -645,7 +663,8 @@ class CoffeeBlackSDK:
                    query: str, 
                    screenshot_data: Optional[bytes] = None,
                    elements_conf: Optional[float] = None, 
-                   rows_conf: Optional[float] = None) -> CoffeeBlackResponse:
+                   rows_conf: Optional[float] = None,
+                   model: Optional[str] = None) -> CoffeeBlackResponse:
         """
         Send a reasoning query to the API without executing any actions.
         Useful for analysis, planning, or information gathering.
@@ -655,17 +674,27 @@ class CoffeeBlackSDK:
             screenshot_data: Optional raw screenshot bytes (if None, uses the active window)
             elements_conf: Optional override for element detection confidence (0.0-1.0)
             rows_conf: Optional override for row detection confidence (0.0-1.0)
+            model: Optional override for UI detection model ("cua", "ui-detect", or "ui-tars")
             
         Returns:
             CoffeeBlackResponse with the API response
             
         Raises:
             ValueError: If no active window is attached and no screenshot is provided
+            ValueError: If invalid model is specified
             RuntimeError: If the API request fails
         """
         # Use default confidence values if not provided
         elements_conf = elements_conf if elements_conf is not None else self.elements_conf
         rows_conf = rows_conf if rows_conf is not None else self.rows_conf
+        
+        # Use default model if not provided
+        selected_model = model if model is not None else self.model
+        
+        # Validate model selection if provided
+        valid_models = ["cua", "ui-detect", "ui-tars"]
+        if selected_model not in valid_models:
+            raise ValueError(f"Model must be one of: {', '.join(valid_models)}")
         
         # Validate confidence thresholds
         if not 0.0 <= elements_conf <= 1.0:
@@ -706,13 +735,13 @@ class CoffeeBlackSDK:
             
             # Log request details
             if self.debug_enabled:
-                timestamp = int(time.time())
                 request_debug = {
                     'url': url,
                     'query': query,
                     'screenshot': os.path.basename(screenshot_path),
                     'elements_conf': elements_conf,
                     'rows_conf': rows_conf,
+                    'model': selected_model,
                     'timestamp': timestamp
                 }
                 debug.log_debug(self.debug_dir, "0", request_debug, "reason_request")
@@ -733,7 +762,7 @@ class CoffeeBlackSDK:
                     data.add_field('execute_action', 'false')
                     
                     # Add the model parameter
-                    data.add_field('model', self.model)
+                    data.add_field('model', selected_model)
                     
                     # Add additional options if using experimental features
                     if self.use_hierarchical_indexing:
@@ -746,52 +775,78 @@ class CoffeeBlackSDK:
                     if self.api_key:
                         headers['Authorization'] = f'Bearer {self.api_key}'
                     
-                    # Send request
-                    async with session.post(url, data=data, headers=headers) as response:
-                        if response.status != 200:
-                            error_text = await response.text()
-                            raise RuntimeError(f"API request failed with status {response.status}: {error_text}")
+                    # Use the retry utility method
+                    success, response_text, error_message = await self._make_api_request_with_retry(
+                        session=session,
+                        url=url,
+                        data=data,
+                        headers=headers,
+                        debug_prefix="reason",
+                        timestamp=timestamp
+                    )
+                    
+                    if not success:
+                        if self.verbose:
+                            print(f"Warning: {error_message}")
                         
-                        # Get the raw response text
-                        response_text = await response.text()
-                        
-                        # Log raw response
-                        if self.debug_enabled:
-                            with open(f'{self.debug_dir}/reason_response_raw_{timestamp}.txt', 'w') as f:
-                                f.write(response_text)
-                        
-                        # Parse response
-                        try:
-                            result = json.loads(response_text)
-                        except json.JSONDecodeError:
-                            raise RuntimeError(f"Failed to parse response as JSON. Response saved to {self.debug_dir}/reason_response_raw_{timestamp}.txt")
-                        
-                        # Remove fields not in our CoffeeBlackResponse type
-                        if 'annotated_screenshot' in result:
-                            del result['annotated_screenshot']
-                        if 'query' in result:
-                            del result['query']
-                        
-                        # Log parsed response
-                        if self.debug_enabled:
-                            with open(f'{self.debug_dir}/reason_response_{timestamp}.json', 'w') as f:
-                                json.dump(result, f, indent=2)
-                        
-                        # Process results
-                        response = CoffeeBlackResponse(
-                            response=response_text,
-                            boxes=result.get("boxes", []),
-                            raw_detections=result.get("raw_detections", {}),
-                            hierarchy=result.get("hierarchy", {}),
-                            num_boxes=len(result.get("boxes", [])),
-                            chosen_action=Action(**result.get("chosen_action", {})) if result.get("chosen_action") else None,
-                            chosen_element_index=result.get("chosen_element_index"),
-                            explanation=result.get("explanation", ""),
-                            timings=result.get("timings")
+                        # Return a default error response instead of raising an exception
+                        return CoffeeBlackResponse(
+                            response=error_message,
+                            boxes=[],
+                            raw_detections={},
+                            hierarchy={},
+                            num_boxes=0,
+                            chosen_action=None,
+                            chosen_element_index=None,
+                            explanation="API request failed",
+                            timings=None
                         )
-                        
-                        return response
-                        
+                    
+                    # Parse response
+                    try:
+                        result = json.loads(response_text)
+                    except json.JSONDecodeError:
+                        if self.verbose:
+                            print(f"Warning: Failed to parse response as JSON. Response saved to {self.debug_dir}/reason_response_raw_{timestamp}.txt")
+                        # Instead of crashing, return a default error response
+                        return CoffeeBlackResponse(
+                            response=f"Failed to parse response as JSON. Response saved to {self.debug_dir}/reason_response_raw_{timestamp}.txt",
+                            boxes=[],
+                            raw_detections={},
+                            hierarchy={},
+                            num_boxes=0,
+                            chosen_action=None,
+                            chosen_element_index=None,
+                            explanation="Failed to parse response",
+                            timings=None
+                        )
+                    
+                    # Remove fields not in our CoffeeBlackResponse type
+                    if 'annotated_screenshot' in result:
+                        del result['annotated_screenshot']
+                    if 'query' in result:
+                        del result['query']
+                    
+                    # Log parsed response
+                    if self.debug_enabled:
+                        with open(f'{self.debug_dir}/reason_response_{timestamp}.json', 'w') as f:
+                            json.dump(result, f, indent=2)
+                    
+                    # Process results
+                    response = CoffeeBlackResponse(
+                        response=response_text,
+                        boxes=result.get("boxes", []),
+                        raw_detections=result.get("raw_detections", {}),
+                        hierarchy=result.get("hierarchy", {}),
+                        num_boxes=len(result.get("boxes", [])),
+                        chosen_action=Action(**result.get("chosen_action", {})) if result.get("chosen_action") else None,
+                        chosen_element_index=result.get("chosen_element_index"),
+                        explanation=result.get("explanation", ""),
+                        timings=result.get("timings")
+                    )
+                    
+                    return response
+                    
         except Exception as e:
             raise RuntimeError(f"Failed to execute reasoning query: {e}")
         finally:
@@ -860,6 +915,8 @@ class CoffeeBlackSDK:
                     except Exception as e:
                         if self.verbose:
                             print(f"Warning: Failed to capture screenshot during wait: {e}")
+                        # Continue with the previous screenshot data rather than failing completely
+                        # This allows the operation to potentially succeed on a retry with the previous image
             
             # If we reach here, we timed out
             if self.verbose:
@@ -902,6 +959,7 @@ class CoffeeBlackSDK:
         # Either use provided screenshot or take one of the active window
         screenshot_path = None
         using_temp_file = False
+        reference_paths = []
         
         try:
             # If no screenshot data is provided, automatically capture one
@@ -911,7 +969,14 @@ class CoffeeBlackSDK:
                         print("No screenshot provided, automatically capturing one...")
                     screenshot_data = await self.get_screenshot()
                 except Exception as e:
-                    raise ValueError(f"Failed to automatically capture screenshot: {e}")
+                    if self.verbose:
+                        print(f"Warning: Failed to automatically capture screenshot: {e}")
+                    # Return a helpful error response instead of crashing
+                    return {
+                        "matches": False,
+                        "confidence": "unknown",
+                        "reasoning": f"Failed to automatically capture screenshot: {e}"
+                    }
             
             # Save the screenshot data to a temporary file
             timestamp = int(time.time())
@@ -940,7 +1005,6 @@ class CoffeeBlackSDK:
             
             # Log request details
             if self.debug_enabled:
-                timestamp = int(time.time())
                 request_debug = {
                     'url': url,
                     'description': description,
@@ -980,40 +1044,72 @@ class CoffeeBlackSDK:
                 if self.api_key:
                     headers['Authorization'] = f'Bearer {self.api_key}'
                 
-                # Send request
-                async with session.post(url, data=data, headers=headers) as response:
-                    if response.status != 200:
-                        error_text = await response.text()
-                        raise RuntimeError(f"API request failed with status {response.status}: {error_text}")
-                    
-                    # Get the raw response text
-                    response_text = await response.text()
-                    
-                    # Log raw response
-                    if self.debug_enabled:
-                        with open(f'{self.debug_dir}/see_response_raw_{timestamp}.txt', 'w') as f:
-                            f.write(response_text)
-                    
-                    # Parse response
-                    try:
-                        result = json.loads(response_text)
-                    except json.JSONDecodeError:
-                        raise RuntimeError(f"Failed to parse response as JSON. Response saved to {self.debug_dir}/see_response_raw_{timestamp}.txt")
-                    
-                    # Log parsed response
-                    if self.debug_enabled:
-                        with open(f'{self.debug_dir}/see_response_{timestamp}.json', 'w') as f:
-                            json.dump(result, f, indent=2)
-                    
+                # Use the retry utility method
+                success, response_text, error_message = await self._make_api_request_with_retry(
+                    session=session,
+                    url=url,
+                    data=data,
+                    headers=headers,
+                    debug_prefix="see",
+                    timestamp=timestamp
+                )
+                
+                if not success:
                     if self.verbose:
-                        # Print key information
-                        print(f"See API Result: Matches={result.get('matches', False)}, " +
-                              f"Confidence={result.get('confidence', 'unknown')}")
-                        if 'reasoning' in result:
-                            print(f"Reasoning: {result['reasoning']}")
+                        print(f"Warning: {error_message}")
                     
-                    return result
+                    # Return a default error response instead of raising an exception
+                    return {
+                        "matches": False,
+                        "confidence": "unknown",
+                        "reasoning": error_message
+                    }
+                
+                # Parse response
+                try:
+                    result = json.loads(response_text)
+                except json.JSONDecodeError:
+                    if self.verbose:
+                        print(f"Warning: Failed to parse response as JSON. Response saved to {self.debug_dir}/see_response_raw_{timestamp}.txt")
+                    # Instead of crashing, return a default error response
+                    return {
+                        "matches": False,
+                        "confidence": "unknown",
+                        "reasoning": f"Failed to parse response as JSON. Response saved to {self.debug_dir}/see_response_raw_{timestamp}.txt"
+                    }
+                
+                # Log parsed response
+                if self.debug_enabled:
+                    with open(f'{self.debug_dir}/see_response_{timestamp}.json', 'w') as f:
+                        json.dump(result, f, indent=2)
+                
+                if self.verbose:
+                    # Print key information
+                    print(f"See API Result: Matches={result.get('matches', False)}, " +
+                          f"Confidence={result.get('confidence', 'unknown')}")
+                    if 'reasoning' in result:
+                        print(f"Reasoning: {result['reasoning']}")
+                
+                return result
         
+        except Exception as e:
+            timestamp = int(time.time())
+            error_message = f"Unexpected error in see implementation: {str(e)}"
+            
+            if self.verbose:
+                print(f"Warning: {error_message}")
+                
+            # Log the error
+            if self.debug_enabled:
+                with open(f'{self.debug_dir}/see_error_{timestamp}.txt', 'w') as f:
+                    f.write(error_message)
+                    
+            # Return a default error response
+            return {
+                "matches": False,
+                "confidence": "unknown",
+                "reasoning": error_message
+            }
         finally:
             # Clean up temporary files
             if using_temp_file and screenshot_path and os.path.exists(screenshot_path):
@@ -1472,3 +1568,140 @@ If the element IS NOT VISIBLE:
             import traceback
             logger.debug(traceback.format_exc())
             return False, None 
+
+    # Add a new utility method for making API requests with retry
+    async def _make_api_request_with_retry(self, 
+                                           session: aiohttp.ClientSession,
+                                           url: str, 
+                                           data: aiohttp.FormData, 
+                                           headers: Dict[str, str],
+                                           debug_prefix: str = "",
+                                           timestamp: int = None):
+        """
+        Make an API request with retry and exponential backoff for transient errors.
+        
+        Args:
+            session: The aiohttp ClientSession to use
+            url: The API endpoint URL
+            data: The FormData to send in the request
+            headers: Headers to include in the request
+            debug_prefix: Prefix for debug logs
+            timestamp: Timestamp for debug logs
+            
+        Returns:
+            Tuple of (success, response_data, error_message)
+        """
+        if timestamp is None:
+            timestamp = int(time.time())
+            
+        retries = 0
+        last_exception = None
+        
+        while retries <= self.max_retries:
+            try:
+                # If this is a retry, wait with exponential backoff
+                if retries > 0:
+                    backoff_time = self.retry_backoff * (2 ** (retries - 1))
+                    if self.verbose:
+                        print(f"Retrying API request (attempt {retries}/{self.max_retries}) after {backoff_time}s backoff")
+                    await asyncio.sleep(backoff_time)
+                
+                async with session.post(url, data=data, headers=headers) as response:
+                    if response.status != 200:
+                        error_text = await response.text()
+                        
+                        # Log the error response
+                        if self.debug_enabled:
+                            with open(f'{self.debug_dir}/{debug_prefix}_error_response_{timestamp}.txt', 'w') as f:
+                                f.write(error_text)
+                                
+                        error_message = f"API request failed with status {response.status}: {error_text}"
+                        
+                        # Only retry on connection errors or 5xx (server) errors, not on client errors (4xx)
+                        if response.status < 500 and response.status != 429:  # Don't retry on client errors except rate limits
+                            return False, None, error_message
+                            
+                        last_exception = RuntimeError(error_message)
+                        retries += 1
+                        continue
+                    
+                    # Get the raw response text
+                    response_text = await response.text()
+                    
+                    # Log raw response
+                    if self.debug_enabled:
+                        with open(f'{self.debug_dir}/{debug_prefix}_response_raw_{timestamp}.txt', 'w') as f:
+                            f.write(response_text)
+                    
+                    return True, response_text, None
+                    
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                # These are possibly transient errors, so we'll retry
+                if self.debug_enabled:
+                    with open(f'{self.debug_dir}/{debug_prefix}_error_{timestamp}_{retries}.txt', 'w') as f:
+                        f.write(f"Error during API request (attempt {retries+1}): {str(e)}\n")
+                        f.write(traceback.format_exc())
+                
+                last_exception = e
+                retries += 1
+                
+            except Exception as e:
+                # Other exceptions we won't retry
+                error_message = f"Unexpected error during API request: {str(e)}"
+                if self.debug_enabled:
+                    with open(f'{self.debug_dir}/{debug_prefix}_error_{timestamp}.txt', 'w') as f:
+                        f.write(error_message + "\n")
+                        f.write(traceback.format_exc())
+                return False, None, error_message
+        
+        # If we've exhausted retries, return failure
+        error_message = f"API request failed after {self.max_retries} retries. Last error: {str(last_exception)}"
+        if self.verbose:
+            print(f"Warning: {error_message}")
+            
+        return False, None, error_message 
+
+    async def scroll_down(self, scroll_percentage: float = 0.5) -> None:
+        """
+        Scroll down by a specified percentage of the window height.
+        
+        This is a simplified version of the more general scroll method that:
+        1. Always scrolls downward
+        2. Always moves the cursor to the center first
+        3. Takes a simple percentage parameter
+        
+        Args:
+            scroll_percentage: Percentage of window height to scroll (0.0-1.0), default 0.5 (50%)
+        """
+        if not 0.0 <= scroll_percentage <= 1.0:
+            raise ValueError(f"scroll_percentage must be between 0.0 and 1.0, got {scroll_percentage}")
+            
+        # Scale down the scroll percentage since the full height may be too large
+        adjusted_percentage = scroll_percentage * 0.5
+            
+        await self.scroll(
+            scroll_direction="down",
+            scroll_amount=adjusted_percentage,
+            click_for_focus=True
+        )
+        
+    async def scroll_up(self, scroll_percentage: float = 0.5) -> None:
+        """
+        Scroll up by a specified percentage of the window height.
+        
+        This is a simplified version of the more general scroll method that:
+        1. Always scrolls upward
+        2. Always moves the cursor to the center first
+        3. Takes a simple percentage parameter
+        
+        Args:
+            scroll_percentage: Percentage of window height to scroll (0.0-1.0), default 0.5 (50%)
+        """
+        if not 0.0 <= scroll_percentage <= 1.0:
+            raise ValueError(f"scroll_percentage must be between 0.0 and 1.0, got {scroll_percentage}")
+            
+        await self.scroll(
+            scroll_direction="up",
+            scroll_amount=scroll_percentage,
+            click_for_focus=True
+        ) 
