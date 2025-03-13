@@ -799,6 +799,240 @@ class CoffeeBlackSDK:
             if using_temp_file and screenshot_path and os.path.exists(screenshot_path):
                 os.remove(screenshot_path)
 
+    async def see(self,
+                description: str,
+                screenshot_data: Optional[bytes] = None,
+                reference_images: Optional[List[bytes]] = None,
+                wait: bool = False,
+                timeout: float = 10.0,
+                interval: float = 0.5) -> Dict[str, Any]:
+        """
+        Call the 'see' API to compare a screenshot with a description and optional reference images.
+        
+        Args:
+            description: Text description of what to look for in the screenshot
+            screenshot_data: Optional raw screenshot bytes (if None, automatically captures a screenshot)
+            reference_images: Optional list of reference image bytes to compare against
+            wait: Whether to wait for the element to appear
+            timeout: Maximum time to wait in seconds (only used if wait=True)
+            interval: Time between checks in seconds (only used if wait=True)
+            
+        Returns:
+            Dictionary with the API response, containing at minimum:
+            - matches (bool): Whether the screenshot matches the description/reference images
+            - confidence (str): Confidence level of the match (high, medium, low)
+            - reasoning (str): Explanation of the match decision
+            
+        Raises:
+            ValueError: If no active window is attached and no screenshot can be captured
+            RuntimeError: If the API request fails
+            TimeoutError: If wait=True and the element doesn't appear within the timeout period
+        """
+        # If wait is True, try repeatedly until timeout
+        if wait:
+            start_time = time.time()
+            last_result = None
+            
+            while time.time() - start_time < timeout:
+                # Call see API with the current screenshot
+                result = await self._see_implementation(
+                    description=description,
+                    screenshot_data=screenshot_data,
+                    reference_images=reference_images
+                )
+                
+                # Store the last result for returning in case of timeout
+                last_result = result
+                
+                # If we found a match, return immediately
+                if result.get('matches', False):
+                    if self.verbose:
+                        print(f"Element found after waiting {time.time() - start_time:.2f} seconds")
+                    return result
+                
+                # Wait before trying again
+                await asyncio.sleep(interval)
+                
+                # Get a fresh screenshot for the next attempt (only if no screenshot_data was provided)
+                if screenshot_data is None:
+                    try:
+                        screenshot_data = await self.get_screenshot()
+                    except Exception as e:
+                        if self.verbose:
+                            print(f"Warning: Failed to capture screenshot during wait: {e}")
+            
+            # If we reach here, we timed out
+            if self.verbose:
+                print(f"Timed out after {timeout} seconds waiting for element to appear")
+            
+            # Return the last result we got
+            return last_result
+        
+        # If wait is False, just do a single check
+        return await self._see_implementation(
+            description=description,
+            screenshot_data=screenshot_data,
+            reference_images=reference_images
+        )
+    
+    async def _see_implementation(self,
+                description: str,
+                screenshot_data: Optional[bytes] = None,
+                reference_images: Optional[List[bytes]] = None) -> Dict[str, Any]:
+        """
+        Internal implementation of the see API call.
+        
+        This contains the actual implementation details that were previously in the see method.
+        
+        Args:
+            description: Text description of what to look for in the screenshot
+            screenshot_data: Optional raw screenshot bytes (if None, automatically captures a screenshot)
+            reference_images: Optional list of reference image bytes to compare against
+            
+        Returns:
+            Dictionary with the API response
+            
+        Raises:
+            ValueError: If no active window is attached and no screenshot can be captured
+            RuntimeError: If the API request fails
+        """
+        # API URL for the see endpoint
+        url = f"{self.base_url}/api/see"
+        
+        # Either use provided screenshot or take one of the active window
+        screenshot_path = None
+        using_temp_file = False
+        
+        try:
+            # If no screenshot data is provided, automatically capture one
+            if screenshot_data is None:
+                try:
+                    if self.verbose:
+                        print("No screenshot provided, automatically capturing one...")
+                    screenshot_data = await self.get_screenshot()
+                except Exception as e:
+                    raise ValueError(f"Failed to automatically capture screenshot: {e}")
+            
+            # Save the screenshot data to a temporary file
+            timestamp = int(time.time())
+            screenshot_path = f"{self.debug_dir}/see_screenshot_{timestamp}.png"
+            with open(screenshot_path, 'wb') as f:
+                f.write(screenshot_data)
+            using_temp_file = True
+            
+            # Get the screenshot filename for the form data
+            screenshot_filename = os.path.basename(screenshot_path)
+            
+            # Prepare reference image paths if provided
+            reference_paths = []
+            reference_contents = []
+            reference_filenames = []
+            
+            if reference_images:
+                for i, ref_img in enumerate(reference_images):
+                    timestamp = int(time.time())
+                    ref_path = f"{self.debug_dir}/see_reference_{i}_{timestamp}.png"
+                    with open(ref_path, 'wb') as f:
+                        f.write(ref_img)
+                    reference_paths.append(ref_path)
+                    reference_contents.append(ref_img)  # Store the binary content
+                    reference_filenames.append(os.path.basename(ref_path))
+            
+            # Log request details
+            if self.debug_enabled:
+                timestamp = int(time.time())
+                request_debug = {
+                    'url': url,
+                    'description': description,
+                    'screenshot': screenshot_filename,
+                    'reference_images': reference_filenames,
+                    'timestamp': timestamp
+                }
+                debug.log_debug(self.debug_dir, "0", request_debug, "see_request")
+            
+            # Send request to API
+            async with aiohttp.ClientSession() as session:
+                # Create form data
+                data = aiohttp.FormData()
+                data.add_field('description', description)
+                
+                # Read screenshot into memory before adding to form data
+                with open(screenshot_path, 'rb') as f:
+                    screenshot_content = f.read()
+                
+                # Add screenshot using the binary content
+                data.add_field('screenshot', 
+                              screenshot_content, 
+                              filename=screenshot_filename,
+                              content_type='image/png')
+                
+                # Add reference images if available
+                for i, ref_path in enumerate(reference_paths):
+                    with open(ref_path, 'rb') as f:
+                        ref_content = f.read()
+                    data.add_field(f'reference{i+1}', 
+                                  ref_content, 
+                                  filename=reference_filenames[i],
+                                  content_type='image/png')
+                
+                # Create headers with Authorization using API key
+                headers = {}
+                if self.api_key:
+                    headers['Authorization'] = f'Bearer {self.api_key}'
+                
+                # Send request
+                async with session.post(url, data=data, headers=headers) as response:
+                    if response.status != 200:
+                        error_text = await response.text()
+                        raise RuntimeError(f"API request failed with status {response.status}: {error_text}")
+                    
+                    # Get the raw response text
+                    response_text = await response.text()
+                    
+                    # Log raw response
+                    if self.debug_enabled:
+                        with open(f'{self.debug_dir}/see_response_raw_{timestamp}.txt', 'w') as f:
+                            f.write(response_text)
+                    
+                    # Parse response
+                    try:
+                        result = json.loads(response_text)
+                    except json.JSONDecodeError:
+                        raise RuntimeError(f"Failed to parse response as JSON. Response saved to {self.debug_dir}/see_response_raw_{timestamp}.txt")
+                    
+                    # Log parsed response
+                    if self.debug_enabled:
+                        with open(f'{self.debug_dir}/see_response_{timestamp}.json', 'w') as f:
+                            json.dump(result, f, indent=2)
+                    
+                    if self.verbose:
+                        # Print key information
+                        print(f"See API Result: Matches={result.get('matches', False)}, " +
+                              f"Confidence={result.get('confidence', 'unknown')}")
+                        if 'reasoning' in result:
+                            print(f"Reasoning: {result['reasoning']}")
+                    
+                    return result
+        
+        finally:
+            # Clean up temporary files
+            if using_temp_file and screenshot_path and os.path.exists(screenshot_path):
+                try:
+                    os.remove(screenshot_path)
+                except Exception as e:
+                    # Just log the error but don't propagate it
+                    if self.verbose:
+                        print(f"Warning: Failed to remove temporary file {screenshot_path}: {e}")
+            
+            for path in reference_paths:
+                if os.path.exists(path):
+                    try:
+                        os.remove(path)
+                    except Exception as e:
+                        # Just log the error but don't propagate it
+                        if self.verbose:
+                            print(f"Warning: Failed to remove temporary file {path}: {e}")
+
     async def press_enter(self) -> None:
         """
         Press the Enter key.

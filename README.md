@@ -4,9 +4,12 @@ Python client for interacting with the CoffeeBlack visual reasoning API.
 
 ## Installation
 
-You can install the package locally using pip:
+You can install the package using pip:
 
 ```bash
+# Install from PyPI
+pip install coffeeblack
+
 # Install from local directory
 pip install -e .
 
@@ -26,26 +29,37 @@ pip install git+https://github.com/coffeeblack/sdk.git
 
 ```python
 import asyncio
-from coffeeblack import CoffeeBlackSDK
+import os
+from coffeeblack import Argus
 
 async def main():
-    # Initialize the SDK
-    sdk = CoffeeBlackSDK()
+    # Initialize the SDK with API key for authentication
+    # You can provide your API key directly or through an environment variable
+    api_key = os.environ.get("COFFEEBLACK_API_KEY")
+    sdk = Argus(
+        api_key=api_key,  # API key for authentication
+        verbose=True,
+        debug_enabled=True,
+        elements_conf=0.2,
+        rows_conf=0.4,
+        model="ui-detect"  # Set the UI detection model to use (cua, ui-detect, or ui-tars)
+    )
     
-    # Get all open windows
-    windows = await sdk.get_open_windows()
+    # Define the browser name
+    browser_name = "Safari" 
     
-    # Attach to a window by name
-    await sdk.attach_to_window_by_name("Chrome")
+    try:
+        # Open and attach to the browser
+        await sdk.open_and_attach_to_app(browser_name, wait_time=2.0)
+
+        # Execute an action based on a natural language query
+        await sdk.execute_action("Type https://www.google.com into the url bar")
+        
+        # Press enter key
+        await sdk.press_key("enter")
     
-    # Execute an action based on natural language
-    response = await sdk.execute_action("Click on the search bar")
-    
-    # Type some text
-    await sdk.press_key("Hello, world!")
-    
-    # Take a screenshot
-    screenshot = await sdk.get_screenshot()
+    except Exception as e:
+        print(f"Error: {e}")
 
 if __name__ == "__main__":
     asyncio.run(main())
