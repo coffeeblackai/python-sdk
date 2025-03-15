@@ -358,6 +358,16 @@ class CoffeeBlackSDK:
                     data.add_field('element_conf', str(elements_conf))
                     data.add_field('row_conf', str(rows_conf))
                     
+                    # Add logging to show what's being sent to API
+                    if self.verbose:
+                        print("\n=== API Request Parameters ===")
+                        print(f"Query: {query}")
+                        print(f"Screenshot: {os.path.basename(screenshot_path)}")
+                        print(f"element_conf: {elements_conf}")  # Note: Using plural in SDK but singular in request
+                        print(f"row_conf: {rows_conf}")         # Note: Using plural in SDK but singular in request
+                        print(f"model: {selected_model}")
+                        print("=============================\n")
+                    
                     # Add the model parameter
                     data.add_field('model', selected_model)
                     
