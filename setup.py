@@ -5,7 +5,7 @@ with open("README.md", "r", encoding="utf-8") as fh:
 
 setup(
     name="coffeeblack",
-    version="0.1.3",
+    version="0.1.4",
     author="CoffeeBlack AI",
     author_email="info@coffeeblack.ai",
     description="Python client for interacting with the CoffeeBlack visual reasoning API",

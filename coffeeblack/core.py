@@ -15,6 +15,7 @@ from typing import List, Dict, Optional, Any, Tuple, Callable, TypeVar, Union
 from .types import WindowInfo, Action, CoffeeBlackResponse
 from .utils import debug, window, screenshot
 from .utils.app_manager import AppManager
+from .tasks import TaskManager
 
 # Configure logging
 import logging
@@ -31,6 +32,7 @@ class CoffeeBlackSDK:
     - Execute actions based on natural language queries
     - Reason about UI elements without executing actions
     - Find and launch applications with semantic search
+    - Manage and process tasks through the CoffeeBlack API
     """
     
     def __init__(self, 
@@ -44,9 +46,11 @@ class CoffeeBlackSDK:
                  verbose: bool = False,
                  elements_conf: float = 0.4,
                  rows_conf: float = 0.3,
+                 container_conf: float = 0.3,
                  model: str = "ui-tars",
-                 max_retries: int = 2,  # Added max_retries parameter with default value of 2
-                 retry_backoff: float = 0.5):  # Added retry_backoff parameter
+                 max_tokens: int = 1024,
+                 max_retries: int = 2,
+                 retry_backoff: float = 0.5):
         """
         Initialize the CoffeeBlack SDK.
         
@@ -61,7 +65,9 @@ class CoffeeBlackSDK:
             verbose: Whether to show verbose output during operations
             elements_conf: Confidence threshold for UI element detection (0.0-1.0)
             rows_conf: Confidence threshold for UI row detection (0.0-1.0)
+            container_conf: Confidence threshold for UI container detection (0.0-1.0)
             model: UI detection model to use ("cua", "ui-detect", or "ui-tars")
+            max_tokens: Maximum number of tokens for model generation (UI-TARS only)
             max_retries: Maximum number of retries for transient errors
             retry_backoff: Backoff time between retries in seconds
         """
@@ -78,6 +84,8 @@ class CoffeeBlackSDK:
             raise ValueError("elements_conf must be between 0.0 and 1.0")
         if not 0.0 <= rows_conf <= 1.0:
             raise ValueError("rows_conf must be between 0.0 and 1.0")
+        if not 0.0 <= container_conf <= 1.0:
+            raise ValueError("container_conf must be between 0.0 and 1.0")
             
         # Validate model selection
         valid_models = ["cua", "ui-detect", "ui-tars"]
@@ -86,7 +94,9 @@ class CoffeeBlackSDK:
             
         self.elements_conf = elements_conf
         self.rows_conf = rows_conf
+        self.container_conf = container_conf
         self.model = model
+        self.max_tokens = max_tokens
         
         # Suppress verbose output if not explicitly enabled
         if not verbose:
@@ -120,6 +130,9 @@ class CoffeeBlackSDK:
             
         # Initialize app manager for app discovery and launching
         self.app_manager = AppManager(use_embeddings=use_embeddings, verbose=verbose)
+        
+        # Initialize task manager for task management
+        self.tasks = TaskManager(self)
         
         # Retry settings
         self.max_retries = max_retries
@@ -276,7 +289,10 @@ class CoffeeBlackSDK:
                            query: str, 
                            elements_conf: Optional[float] = None, 
                            rows_conf: Optional[float] = None,
-                           model: Optional[str] = None) -> CoffeeBlackResponse:
+                           model: Optional[str] = None,
+                           max_tokens: Optional[int] = None,
+                           reference_element: Optional[Union[str, bytes]] = None,
+                           container_conf: Optional[float] = None) -> CoffeeBlackResponse:
         """
         Execute a natural language query on the API and optionally execute the chosen action.
         
@@ -285,6 +301,9 @@ class CoffeeBlackSDK:
             elements_conf: Optional override for element detection confidence (0.0-1.0)
             rows_conf: Optional override for row detection confidence (0.0-1.0)
             model: Optional override for UI detection model ("cua", "ui-detect", or "ui-tars")
+            max_tokens: Optional maximum number of tokens for model generation (UI-TARS only)
+            reference_element: Optional image data (bytes) or file path (str) of a reference UI element to help with detection
+            container_conf: Optional override for container detection confidence (0.0-1.0)
             
         Returns:
             CoffeeBlackResponse with the API response
@@ -315,6 +334,8 @@ class CoffeeBlackSDK:
             raise ValueError("elements_conf must be between 0.0 and 1.0")
         if not 0.0 <= rows_conf <= 1.0:
             raise ValueError("rows_conf must be between 0.0 and 1.0")
+        if container_conf is not None and not 0.0 <= container_conf <= 1.0:
+            raise ValueError("container_conf must be between 0.0 and 1.0")
 
         # Always take a fresh screenshot - this is essential for accurate coordinates
         # especially after scrolling operations
@@ -329,6 +350,22 @@ class CoffeeBlackSDK:
         else:
             raise RuntimeError("Failed to take screenshot of active window")
         
+        # Prepare reference element if provided
+        reference_element_data = None
+        using_reference_element = False
+        
+        if reference_element is not None:
+            # Check if reference_element is a file path (str) or image data (bytes)
+            if isinstance(reference_element, str):
+                # It's a file path, read the file
+                with open(reference_element, 'rb') as f:
+                    reference_element_data = f.read()
+            else:
+                # It's already image data (bytes), use it directly
+                reference_element_data = reference_element
+            
+            using_reference_element = True
+        
         # API URL for the reason endpoint
         url = f"{self.base_url}/api/reason"
         
@@ -342,6 +379,8 @@ class CoffeeBlackSDK:
                     'elements_conf': elements_conf,
                     'rows_conf': rows_conf,
                     'model': selected_model,
+                    'reference_element': 'reference_element.png' if using_reference_element else None,
+                    'container_conf': container_conf,
                     'timestamp': timestamp
                 }
                 debug.log_debug(self.debug_dir, "0", request_debug, "request")
@@ -358,6 +397,17 @@ class CoffeeBlackSDK:
                     data.add_field('element_conf', str(elements_conf))
                     data.add_field('row_conf', str(rows_conf))
                     
+                    # Add container confidence if provided
+                    if container_conf is not None:
+                        data.add_field('container_conf', str(container_conf))
+                    
+                    # Add reference element if provided
+                    if using_reference_element:
+                        data.add_field('reference_element', 
+                                     reference_element_data,
+                                     filename='reference_element.png',
+                                     content_type='image/png')
+                    
                     # Add logging to show what's being sent to API
                     if self.verbose:
                         print("\n=== API Request Parameters ===")
@@ -365,11 +415,20 @@ class CoffeeBlackSDK:
                         print(f"Screenshot: {os.path.basename(screenshot_path)}")
                         print(f"element_conf: {elements_conf}")  # Note: Using plural in SDK but singular in request
                         print(f"row_conf: {rows_conf}")         # Note: Using plural in SDK but singular in request
+                        if container_conf is not None:
+                            print(f"container_conf: {container_conf}")
                         print(f"model: {selected_model}")
+                        if using_reference_element:
+                            print(f"reference_element: reference_element.png")
                         print("=============================\n")
                     
                     # Add the model parameter
                     data.add_field('model', selected_model)
+                    
+                    # Add max_tokens parameter if provided (UI-TARS only)
+                    if selected_model == "ui-tars":
+                        tokens = max_tokens if max_tokens is not None else self.max_tokens
+                        data.add_field('max_tokens', str(tokens))
                     
                     # Add additional options if using experimental features
                     if self.use_hierarchical_indexing:
@@ -425,6 +484,24 @@ class CoffeeBlackSDK:
                         if debug_viz_path:
                             print(f"Debug visualization saved to: {debug_viz_path}")
                     
+                    # Handle different API response formats (ui-tars vs ui-detect)
+                    chosen_action = None
+                    if 'chosen_action' in result:
+                        # Standard format
+                        chosen_action = Action(**result.get("chosen_action", {})) if result.get("chosen_action") else None
+                    elif 'action' in result:
+                        # UI-TARS format - convert to our Action format
+                        action_data = result.get('action', {})
+                        if action_data:
+                            # Map 'type' to 'action' for UI-TARS responses
+                            chosen_action = Action(
+                                action=action_data.get('type'),  # Map 'type' to 'action'
+                                key_command=action_data.get('key_command'),
+                                input_text=action_data.get('input_text'),
+                                scroll_direction=action_data.get('scroll_direction'),
+                                confidence=1.0  # Default confidence if not provided
+                            )
+                    
                     # Process results and find best element
                     response = CoffeeBlackResponse(
                         response=response_text,
@@ -432,7 +509,7 @@ class CoffeeBlackSDK:
                         raw_detections=result.get("raw_detections", {}),
                         hierarchy=result.get("hierarchy", {}),
                         num_boxes=len(result.get("boxes", [])),
-                        chosen_action=Action(**result.get("chosen_action", {})) if result.get("chosen_action") else None,
+                        chosen_action=chosen_action,
                         chosen_element_index=result.get("chosen_element_index"),
                         explanation=result.get("explanation", ""),
                         timings=result.get("timings")
@@ -456,7 +533,45 @@ class CoffeeBlackSDK:
                             print(f"\nDebug coordinate calculation:")
                             print(f"Window position: ({window_x}, {window_y})")
                             print(f"Window dimensions: {bounds['width']}x{bounds['height']}")
-                            print(f"Original bbox: x1={bbox['x1']}, y1={bbox['y1']}, x2={bbox['x2']}, y2={bbox['y2']}")
+                            
+                            # Check if we have pre-calculated absolute coordinates from the API
+                            if "absolute_coordinates" in chosen_box:
+                                print(f"Using pre-calculated absolute coordinates: {chosen_box['absolute_coordinates']}")
+                                abs_x = chosen_box["absolute_coordinates"][0]
+                                abs_y = chosen_box["absolute_coordinates"][1]
+                                
+                                # Still need to apply window offset
+                                element_x = int(window_x + abs_x)
+                                element_y = int(window_y + abs_y)
+                                print(f"After window offset: ({element_x}, {element_y})")
+                                
+                                # Set these for debug logging below
+                                element_width = int(bbox['x2'] - bbox['x1'])
+                                element_height = int(bbox['y2'] - bbox['y1'])
+                            
+                            # Check if we have normalized coordinates from UI-TARS
+                            elif "normalized_coordinates" in chosen_box:
+                                print(f"Using normalized coordinates: {chosen_box['normalized_coordinates']}")
+                                norm_x = chosen_box["normalized_coordinates"][0]
+                                norm_y = chosen_box["normalized_coordinates"][1]
+                                
+                                # UI-TARS uses a 0-1000 scale, so we need to convert to pixels
+                                # based on the screenshot/window dimensions
+                                abs_x = int(norm_x * bounds['width'] / 1000)
+                                abs_y = int(norm_y * bounds['height'] / 1000)
+                                
+                                # Apply window offset
+                                element_x = int(window_x + abs_x)
+                                element_y = int(window_y + abs_y)
+                                print(f"Calculated from normalized (0-1000): ({element_x}, {element_y})")
+                                
+                                # Set these for debug logging below
+                                element_width = int(bbox['x2'] - bbox['x1'])
+                                element_height = int(bbox['y2'] - bbox['y1'])
+                            
+                            else:
+                                # Original bbox-based calculation
+                                print(f"Original bbox: x1={bbox['x1']}, y1={bbox['y1']}, x2={bbox['x2']}, y2={bbox['y2']}")
                             
                             # Detect the DPI scaling for the specific monitor this window is on
                             display_dpi = screenshot.detect_retina_dpi(target_bounds=bounds)
@@ -668,13 +783,21 @@ class CoffeeBlackSDK:
                     
         except Exception as e:
             raise RuntimeError(f"Failed to execute action: {e}")
+        finally:
+            # Clean up temporary reference element file if we created one
+            if using_reference_element and reference_element_data:
+                # No need to clean up since we're using the data directly
+                pass
 
     async def reason(self, 
                    query: str, 
                    screenshot_data: Optional[bytes] = None,
                    elements_conf: Optional[float] = None, 
                    rows_conf: Optional[float] = None,
-                   model: Optional[str] = None) -> CoffeeBlackResponse:
+                   model: Optional[str] = None,
+                   max_tokens: Optional[int] = None,
+                   reference_element: Optional[bytes] = None,
+                   container_conf: Optional[float] = None) -> CoffeeBlackResponse:
         """
         Send a reasoning query to the API without executing any actions.
         Useful for analysis, planning, or information gathering.
@@ -685,6 +808,9 @@ class CoffeeBlackSDK:
             elements_conf: Optional override for element detection confidence (0.0-1.0)
             rows_conf: Optional override for row detection confidence (0.0-1.0)
             model: Optional override for UI detection model ("cua", "ui-detect", or "ui-tars")
+            max_tokens: Optional maximum number of tokens for model generation (UI-TARS only)
+            reference_element: Optional image data (bytes) of a reference UI element to help with detection
+            container_conf: Optional override for container detection confidence (0.0-1.0)
             
         Returns:
             CoffeeBlackResponse with the API response
@@ -711,6 +837,8 @@ class CoffeeBlackSDK:
             raise ValueError("elements_conf must be between 0.0 and 1.0")
         if not 0.0 <= rows_conf <= 1.0:
             raise ValueError("rows_conf must be between 0.0 and 1.0")
+        if container_conf is not None and not 0.0 <= container_conf <= 1.0:
+            raise ValueError("container_conf must be between 0.0 and 1.0")
             
         # API URL for the reason endpoint
         url = f"{self.base_url}/api/reason"
@@ -718,6 +846,18 @@ class CoffeeBlackSDK:
         # Either use provided screenshot or take one of the active window
         screenshot_path = None
         using_temp_file = False
+        
+        # Prepare reference element if provided
+        reference_element_path = None
+        using_reference_element = False
+        
+        if reference_element is not None:
+            # Save the reference element to a temporary file
+            timestamp_ref = int(time.time())
+            reference_element_path = f"{self.debug_dir}/reason_reference_element_{timestamp_ref}.png"
+            with open(reference_element_path, 'wb') as f:
+                f.write(reference_element)
+            using_reference_element = True
         
         try:
             if screenshot_data is not None:
@@ -752,6 +892,8 @@ class CoffeeBlackSDK:
                     'elements_conf': elements_conf,
                     'rows_conf': rows_conf,
                     'model': selected_model,
+                    'reference_element': os.path.basename(reference_element_path) if using_reference_element else None,
+                    'container_conf': container_conf,
                     'timestamp': timestamp
                 }
                 debug.log_debug(self.debug_dir, "0", request_debug, "reason_request")
@@ -768,11 +910,28 @@ class CoffeeBlackSDK:
                     data.add_field('element_conf', str(elements_conf))
                     data.add_field('row_conf', str(rows_conf))
                     
+                    # Add container confidence if provided
+                    if container_conf is not None:
+                        data.add_field('container_conf', str(container_conf))
+                    
+                    # Add reference element if provided
+                    if using_reference_element:
+                        with open(reference_element_path, 'rb') as ref_f:
+                            data.add_field('reference_element', 
+                                           ref_f, 
+                                           filename=os.path.basename(reference_element_path),
+                                           content_type='image/png')
+                    
                     # Disable action execution
                     data.add_field('execute_action', 'false')
                     
                     # Add the model parameter
                     data.add_field('model', selected_model)
+                    
+                    # Add max_tokens parameter if provided (UI-TARS only)
+                    if selected_model == "ui-tars":
+                        tokens = max_tokens if max_tokens is not None else self.max_tokens
+                        data.add_field('max_tokens', str(tokens))
                     
                     # Add additional options if using experimental features
                     if self.use_hierarchical_indexing:
@@ -842,6 +1001,24 @@ class CoffeeBlackSDK:
                         with open(f'{self.debug_dir}/reason_response_{timestamp}.json', 'w') as f:
                             json.dump(result, f, indent=2)
                     
+                    # Handle different API response formats (ui-tars vs ui-detect)
+                    chosen_action = None
+                    if 'chosen_action' in result:
+                        # Standard format
+                        chosen_action = Action(**result.get("chosen_action", {})) if result.get("chosen_action") else None
+                    elif 'action' in result:
+                        # UI-TARS format - convert to our Action format
+                        action_data = result.get('action', {})
+                        if action_data:
+                            # Map 'type' to 'action' for UI-TARS responses
+                            chosen_action = Action(
+                                action=action_data.get('type'),  # Map 'type' to 'action'
+                                key_command=action_data.get('key_command'),
+                                input_text=action_data.get('input_text'),
+                                scroll_direction=action_data.get('scroll_direction'),
+                                confidence=1.0  # Default confidence if not provided
+                            )
+                    
                     # Process results
                     response = CoffeeBlackResponse(
                         response=response_text,
@@ -849,7 +1026,7 @@ class CoffeeBlackSDK:
                         raw_detections=result.get("raw_detections", {}),
                         hierarchy=result.get("hierarchy", {}),
                         num_boxes=len(result.get("boxes", [])),
-                        chosen_action=Action(**result.get("chosen_action", {})) if result.get("chosen_action") else None,
+                        chosen_action=chosen_action,
                         chosen_element_index=result.get("chosen_element_index"),
                         explanation=result.get("explanation", ""),
                         timings=result.get("timings")
@@ -860,9 +1037,23 @@ class CoffeeBlackSDK:
         except Exception as e:
             raise RuntimeError(f"Failed to execute reasoning query: {e}")
         finally:
-            # Clean up temporary file if we created one
+            # Clean up temporary files
             if using_temp_file and screenshot_path and os.path.exists(screenshot_path):
-                os.remove(screenshot_path)
+                try:
+                    os.remove(screenshot_path)
+                except Exception as e:
+                    if self.verbose:
+                        print(f"Warning: Failed to remove temporary screenshot file {screenshot_path}: {e}")
+            
+            # Clean up temporary reference element file if we created one
+            if using_reference_element and reference_element_path and os.path.exists(reference_element_path):
+                # Only remove if it's a temporary file (contains a timestamp in the path)
+                if str(timestamp_ref) in reference_element_path:
+                    try:
+                        os.remove(reference_element_path)
+                    except Exception as e:
+                        if self.verbose:
+                            print(f"Warning: Failed to remove temporary reference element file {reference_element_path}: {e}")
 
     async def see(self,
                 description: str,
@@ -1139,6 +1330,429 @@ class CoffeeBlackSDK:
                         if self.verbose:
                             print(f"Warning: Failed to remove temporary file {path}: {e}")
 
+    async def scroll_down(self, scroll_percentage: float = 0.5) -> None:
+        """
+        Scroll down by a specified percentage of the window height.
+        
+        This is a simplified version of the more general scroll method that:
+        1. Always scrolls downward
+        2. Always moves the cursor to the center first
+        3. Takes a simple percentage parameter
+        
+        Args:
+            scroll_percentage: Percentage of window height to scroll (0.0-1.0), default 0.5 (50%)
+        """
+        if not 0.0 <= scroll_percentage <= 1.0:
+            raise ValueError(f"scroll_percentage must be between 0.0 and 1.0, got {scroll_percentage}")
+            
+        # Scale down the scroll percentage since the full height may be too large
+        adjusted_percentage = scroll_percentage * 0.5
+            
+        await self.scroll(
+            scroll_direction="down",
+            scroll_amount=adjusted_percentage,
+            click_for_focus=True
+        )
+        
+    async def scroll_up(self, scroll_percentage: float = 0.5) -> None:
+        """
+        Scroll up by a specified percentage of the window height.
+        
+        This is a simplified version of the more general scroll method that:
+        1. Always scrolls upward
+        2. Always moves the cursor to the center first
+        3. Takes a simple percentage parameter
+        
+        Args:
+            scroll_percentage: Percentage of window height to scroll (0.0-1.0), default 0.5 (50%)
+        """
+        if not 0.0 <= scroll_percentage <= 1.0:
+            raise ValueError(f"scroll_percentage must be between 0.0 and 1.0, got {scroll_percentage}")
+            
+        await self.scroll(
+            scroll_direction="up",
+            scroll_amount=scroll_percentage,
+            click_for_focus=True
+        ) 
+        
+    async def solve_captcha(self, 
+                           screenshot_data: Optional[bytes] = None,
+                           max_attempts: int = 15,
+                           click_checkbox_first: bool = True,
+                           checkbox_wait_time: float = 3.0,
+                           apply_solution: bool = True,
+                           click_delay: float = 0.5) -> Dict[str, Any]:
+        """
+        Detect and solve a CAPTCHA challenge automatically.
+        
+        This method handles the entire CAPTCHA solving process:
+        1. Detects if a CAPTCHA challenge is present on the screen
+        2. Clicks the "I'm not a robot" checkbox if needed
+        3. Detects if a visual challenge appears after clicking the checkbox
+        4. Solves the visual challenge if needed
+        5. Automatically clicks on the solution coordinates if apply_solution=True
+        
+        Args:
+            screenshot_data: Optional raw screenshot bytes (if None, automatically captures a screenshot)
+            max_attempts: Maximum number of attempts to solve the CAPTCHA (default: 15)
+            click_checkbox_first: Whether to click the "I'm not a robot" checkbox first (default: True)
+            checkbox_wait_time: Time to wait after clicking the checkbox for animations (default: 3.0)
+            apply_solution: Whether to automatically click on the solution coordinates (default: True)
+            click_delay: Delay in seconds between clicks when multiple coordinates are returned (default: 0.5)
+                
+        Returns:
+            Dictionary containing the CAPTCHA solving results with fields:
+            - status: 'success', 'no_captcha_detected', or error status
+            - solution: Coordinates for clicking and visualized image (if visual challenge solved)
+            - captchaAnalysis: Information about the CAPTCHA type and requirements (if visual challenge solved)
+            - timing: Performance metrics for the solution process
+            - click_status: Status of coordinate clicking if apply_solution=True
+            - error: Error message if something went wrong
+                
+        Raises:
+            ValueError: If no active window is attached and no screenshot can be captured
+        """
+        try:
+            if self.verbose:
+                print("Starting CAPTCHA detection and solving process...")
+            
+            # If no screenshot data is provided, automatically capture one
+            if screenshot_data is None:
+                try:
+                    if self.verbose:
+                        print("Capturing screenshot for CAPTCHA detection...")
+                    screenshot_data = await self.get_screenshot()
+                except Exception as e:
+                    error_msg = f"Failed to capture screenshot: {e}"
+                    if self.verbose:
+                        print(f"Warning: {error_msg}")
+                    return {
+                        "status": "error",
+                        "error": error_msg
+                    }
+            
+            # Check if there's a CAPTCHA challenge checkbox
+            if self.verbose:
+                print("Checking if there's a CAPTCHA challenge...")
+            
+            visual_captcha_query = "Is there a CAPTCHA challenge check box that needs to be clicked?"
+            see_response = await self.see(visual_captcha_query, screenshot_data=screenshot_data)
+            
+            # If no CAPTCHA detected, return early
+            if not see_response.get("matches", False):
+                if self.verbose:
+                    print("No CAPTCHA challenge detected.")
+                return {
+                    "status": "no_captcha_detected",
+                    "message": "No CAPTCHA challenge detected on the screen."
+                }
+            
+            if self.verbose:
+                print("CAPTCHA challenge detected!")
+            
+            # Click the "I'm not a robot" checkbox if requested
+            if click_checkbox_first:
+                if self.verbose:
+                    print("Clicking the 'I'm not a robot' checkbox...")
+                
+                try:
+                    checkbox_response = await self.execute_action("Click the 'I'm not a robot' checkbox")
+                    
+                    # Wait for any animations
+                    if self.verbose:
+                        print(f"Waiting {checkbox_wait_time} seconds for animations...")
+                    await asyncio.sleep(checkbox_wait_time)
+                    
+                    # Get a new screenshot after clicking
+                    screenshot_data = await self.get_screenshot()
+                except Exception as e:
+                    error_msg = f"Failed to click CAPTCHA checkbox: {e}"
+                    if self.verbose:
+                        print(f"Warning: {error_msg}")
+                    return {
+                        "status": "error",
+                        "error": error_msg
+                    }
+            
+            # Check if we need to solve a visual challenge
+            challenge_query = "Is there a visual challenge that needs to be solved? This would be the case where the checkbox click did not work and a pop up has appeared."
+            challenge_response = await self.see(challenge_query, screenshot_data=screenshot_data)
+            
+            if not challenge_response.get("matches", False):
+                if self.verbose:
+                    print("CAPTCHA checkbox accepted, no visual challenge needed.")
+                return {
+                    "status": "success",
+                    "message": "CAPTCHA checkbox accepted without visual challenge."
+                }
+            
+            # Visual challenge detected, solve it
+            if self.verbose:
+                print("Visual challenge detected, solving...")
+            
+            # Call the API to solve the visual challenge
+            # API URL for the captcha endpoint
+            url = f"{self.base_url}/api/captcha"
+            
+            # Save the screenshot data to a temporary file
+            screenshot_path = None
+            using_temp_file = False
+            timestamp = int(time.time())
+            
+            try:
+                # Save the screenshot data to a temporary file
+                screenshot_path = f"{self.debug_dir}/captcha_screenshot_{timestamp}.png"
+                with open(screenshot_path, 'wb') as f:
+                    f.write(screenshot_data)
+                using_temp_file = True
+                
+                # Get the screenshot filename for the form data
+                screenshot_filename = os.path.basename(screenshot_path)
+                
+                # Log request details
+                if self.debug_enabled:
+                    request_debug = {
+                        'url': url,
+                        'max_attempts': max_attempts,
+                        'screenshot': screenshot_filename,
+                        'timestamp': timestamp
+                    }
+                    debug.log_debug(self.debug_dir, "0", request_debug, "captcha_request")
+                
+                # Send request to API
+                async with aiohttp.ClientSession() as session:
+                    # Create form data
+                    data = aiohttp.FormData()
+                    data.add_field('max_attempts', str(max_attempts))
+                    
+                    # Read screenshot into memory before adding to form data
+                    with open(screenshot_path, 'rb') as f:
+                        screenshot_content = f.read()
+                    
+                    # Add screenshot using the binary content
+                    data.add_field('file', 
+                                  screenshot_content, 
+                                  filename=screenshot_filename,
+                                  content_type='image/png')
+                    
+                    # Create headers with Authorization if API key is provided
+                    headers = {}
+                    if self.api_key:
+                        headers['Authorization'] = f'Bearer {self.api_key}'
+                    
+                    # Use the retry utility method
+                    success, response_text, error_message = await self._make_api_request_with_retry(
+                        session=session,
+                        url=url,
+                        data=data,
+                        headers=headers,
+                        debug_prefix="captcha",
+                        timestamp=timestamp
+                    )
+                    
+                    if not success:
+                        if self.verbose:
+                            print(f"Warning: CAPTCHA solving failed: {error_message}")
+                        
+                        # Return a detailed error response
+                        return {
+                            "status": "error",
+                            "error": error_message
+                        }
+                    
+                    # Parse response
+                    try:
+                        result = json.loads(response_text)
+                    except json.JSONDecodeError:
+                        error_msg = f"Failed to parse response as JSON. Response saved to {self.debug_dir}/captcha_response_raw_{timestamp}.txt"
+                        if self.verbose:
+                            print(f"Warning: {error_msg}")
+                        
+                        # Save the raw response for debugging
+                        with open(f'{self.debug_dir}/captcha_response_raw_{timestamp}.txt', 'w') as f:
+                            f.write(response_text)
+                        
+                        return {
+                            "status": "error",
+                            "error": error_msg
+                        }
+                    
+                    # Log parsed response
+                    if self.debug_enabled:
+                        with open(f'{self.debug_dir}/captcha_response_{timestamp}.json', 'w') as f:
+                            json.dump(result, f, indent=2)
+                    
+                    if self.verbose:
+                        # Print key information
+                        print(f"CAPTCHA Solution: Status={result.get('status', 'unknown')}")
+                        if 'captchaAnalysis' in result:
+                            analysis = result['captchaAnalysis']
+                            print(f"CAPTCHA Type: {analysis.get('actionType', 'unknown')}")
+                            print(f"Instructions: {analysis.get('instructions', 'unknown')}")
+                    
+                    # Add our enhanced metadata to the result
+                    result["captchaDetectionMethod"] = "automatic"
+                    
+                    # Apply solution by clicking on the coordinates if requested
+                    if apply_solution and result.get("status") == "success":
+                        try:
+                            if self.verbose:
+                                print("Applying CAPTCHA solution by clicking on the coordinates...")
+                            
+                            # Get coordinates from the solution
+                            solution_data = result.get("solution", {})
+                            coordinates = solution_data.get("coordinates", [])
+                            
+                            if not coordinates:
+                                if self.verbose:
+                                    print("No coordinates found in the solution.")
+                                result["click_status"] = "no_coordinates"
+                            else:
+                                if self.verbose:
+                                    print(f"Found {len(coordinates)} coordinates to click on.")
+                                
+                                # Get window bounds for coordinate translation
+                                window_bounds = None
+                                if self.active_window:
+                                    window_bounds = self.active_window.bounds
+                                    
+                                # Debug log
+                                if self.verbose:
+                                    print(f"Window bounds: {window_bounds}")
+                                    print(f"Raw coordinates: {coordinates}")
+                                
+                                # Click on each coordinate
+                                for i, coord in enumerate(coordinates):
+                                    try:
+                                        # Extract x, y from coordinate object
+                                        x = coord.get("x")
+                                        y = coord.get("y")
+                                        
+                                        if x is None or y is None:
+                                            if self.verbose:
+                                                print(f"Warning: Invalid coordinate format for item {i}: {coord}")
+                                            continue
+                                        
+                                        # Apply window offset if we have active window bounds
+                                        if window_bounds:
+                                            window_x = window_bounds["x"]
+                                            window_y = window_bounds["y"]
+                                            screen_x = window_x + x
+                                            screen_y = window_y + y
+                                        else:
+                                            # Use coordinates as-is if no window bounds
+                                            screen_x = x
+                                            screen_y = y
+                                        
+                                        if self.verbose:
+                                            print(f"Clicking on coordinate {i+1}: ({x}, {y}) -> screen position: ({screen_x}, {screen_y})")
+                                        
+                                        # Perform the click
+                                        pyautogui.moveTo(screen_x, screen_y, duration=0.3)
+                                        pyautogui.click()
+                                        
+                                        # Small pause between clicks if there are multiple
+                                        if i < len(coordinates) - 1:
+                                            await asyncio.sleep(click_delay)
+                                            
+                                    except Exception as e:
+                                        if self.verbose:
+                                            print(f"Error clicking coordinate {i+1}: {e}")
+                                
+                                # Short wait after clicking all coordinates
+                                await asyncio.sleep(1.0)
+                                
+                                # Get a follow-up screenshot to verify the result
+                                try:
+                                    final_screenshot = await self.get_screenshot()
+                                    if self.debug_enabled:
+                                        final_path = f"{self.debug_dir}/captcha_after_click_{timestamp}.png"
+                                        with open(final_path, 'wb') as f:
+                                            f.write(final_screenshot)
+                                except Exception as e:
+                                    if self.verbose:
+                                        print(f"Warning: Failed to capture post-click screenshot: {e}")
+                                
+                                # Mark as successful
+                                result["click_status"] = "success"
+                                result["click_details"] = {
+                                    "coordinates_clicked": len(coordinates),
+                                    "window_offset_applied": window_bounds is not None
+                                }
+                                
+                                if self.verbose:
+                                    print("Successfully applied CAPTCHA solution.")
+                        except Exception as e:
+                            error_msg = f"Error applying CAPTCHA solution: {str(e)}"
+                            if self.verbose:
+                                print(f"Warning: {error_msg}")
+                                traceback.print_exc()
+                            result["click_status"] = "error"
+                            result["click_error"] = error_msg
+                    
+                    return result
+                
+            except Exception as e:
+                error_msg = f"Unexpected error in CAPTCHA solving: {str(e)}"
+                if self.verbose:
+                    print(f"Warning: {error_msg}")
+                    traceback.print_exc()
+                
+                # Log the error
+                if self.debug_enabled:
+                    with open(f'{self.debug_dir}/captcha_error_{timestamp}.txt', 'w') as f:
+                        f.write(error_msg)
+                        f.write("\n\n")
+                        f.write(traceback.format_exc())
+                
+                return {
+                    "status": "error",
+                    "error": error_msg
+                }
+            finally:
+                # Clean up temporary files
+                if using_temp_file and screenshot_path and os.path.exists(screenshot_path):
+                    try:
+                        os.remove(screenshot_path)
+                    except Exception as e:
+                        # Just log the error but don't propagate it
+                        if self.verbose:
+                            print(f"Warning: Failed to remove temporary file {screenshot_path}: {e}")
+            
+        except Exception as e:
+            error_msg = f"Unexpected error in CAPTCHA detection and solving: {str(e)}"
+            if self.verbose:
+                print(f"Warning: {error_msg}")
+                traceback.print_exc()
+            
+            return {
+                "status": "error",
+                "error": error_msg
+            }
+
+    async def load_reference_element(self, file_path: str) -> bytes:
+        """
+        Load a reference element image from a file path.
+        
+        Args:
+            file_path: Path to the reference element image file
+            
+        Returns:
+            Bytes of the reference element image
+            
+        Raises:
+            FileNotFoundError: If the file doesn't exist
+            IOError: If there's an error reading the file
+        """
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"Reference element file not found: {file_path}")
+            
+        try:
+            with open(file_path, 'rb') as f:
+                return f.read()
+        except Exception as e:
+            raise IOError(f"Error reading reference element file: {e}")
+            
     async def press_enter(self) -> None:
         """
         Press the Enter key.
@@ -1670,48 +2284,3 @@ If the element IS NOT VISIBLE:
             print(f"Warning: {error_message}")
             
         return False, None, error_message 
-
-    async def scroll_down(self, scroll_percentage: float = 0.5) -> None:
-        """
-        Scroll down by a specified percentage of the window height.
-        
-        This is a simplified version of the more general scroll method that:
-        1. Always scrolls downward
-        2. Always moves the cursor to the center first
-        3. Takes a simple percentage parameter
-        
-        Args:
-            scroll_percentage: Percentage of window height to scroll (0.0-1.0), default 0.5 (50%)
-        """
-        if not 0.0 <= scroll_percentage <= 1.0:
-            raise ValueError(f"scroll_percentage must be between 0.0 and 1.0, got {scroll_percentage}")
-            
-        # Scale down the scroll percentage since the full height may be too large
-        adjusted_percentage = scroll_percentage * 0.5
-            
-        await self.scroll(
-            scroll_direction="down",
-            scroll_amount=adjusted_percentage,
-            click_for_focus=True
-        )
-        
-    async def scroll_up(self, scroll_percentage: float = 0.5) -> None:
-        """
-        Scroll up by a specified percentage of the window height.
-        
-        This is a simplified version of the more general scroll method that:
-        1. Always scrolls upward
-        2. Always moves the cursor to the center first
-        3. Takes a simple percentage parameter
-        
-        Args:
-            scroll_percentage: Percentage of window height to scroll (0.0-1.0), default 0.5 (50%)
-        """
-        if not 0.0 <= scroll_percentage <= 1.0:
-            raise ValueError(f"scroll_percentage must be between 0.0 and 1.0, got {scroll_percentage}")
-            
-        await self.scroll(
-            scroll_direction="up",
-            scroll_amount=scroll_percentage,
-            click_for_focus=True
-        ) 

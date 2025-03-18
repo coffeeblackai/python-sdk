@@ -50,3 +50,14 @@ local_settings.py
 .ruff_cache/ 
 
 debug/
+
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bmp
+*.tiff
+*.ico
+*.webp
+
+coffeeblack.json

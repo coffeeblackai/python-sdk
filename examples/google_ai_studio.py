@@ -54,7 +54,7 @@ async def main():
             for char in text:
                 await sdk.press_key(char)
             
-        await type_text(sdk, "Add a girlfriend next to him")
+        await type_text(sdk, "Add a wife next to him")
         time.sleep(1)
 
         # Click on the Add Attachment button in the chat box
