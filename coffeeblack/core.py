@@ -1404,6 +1404,7 @@ class CoffeeBlackSDK:
         3. Detects if a visual challenge appears after clicking the checkbox
         4. Solves the visual challenge if needed
         5. Automatically clicks on the solution coordinates if apply_solution=True
+        6. Clicks the verify/submit button after selecting tiles
         
         Args:
             screenshot_data: Optional raw screenshot bytes (if None, automatically captures a screenshot)
@@ -1420,6 +1421,7 @@ class CoffeeBlackSDK:
             - captchaAnalysis: Information about the CAPTCHA type and requirements (if visual challenge solved)
             - timing: Performance metrics for the solution process
             - click_status: Status of coordinate clicking if apply_solution=True
+            - verify_button_clicked: Whether the verify button was successfully clicked
             - error: Error message if something went wrong
                 
         Raises:
@@ -1429,29 +1431,13 @@ class CoffeeBlackSDK:
             if self.verbose:
                 print("Starting CAPTCHA detection and solving process...")
             
-            # If no screenshot data is provided, automatically capture one
             if screenshot_data is None:
-                try:
-                    if self.verbose:
-                        print("Capturing screenshot for CAPTCHA detection...")
-                    screenshot_data = await self.get_screenshot()
-                except Exception as e:
-                    error_msg = f"Failed to capture screenshot: {e}"
-                    if self.verbose:
-                        print(f"Warning: {error_msg}")
-                    return {
-                        "status": "error",
-                        "error": error_msg
-                    }
+                screenshot_data = await self.get_screenshot()
             
-            # Check if there's a CAPTCHA challenge checkbox
-            if self.verbose:
-                print("Checking if there's a CAPTCHA challenge...")
-            
-            visual_captcha_query = "Is there a CAPTCHA challenge check box that needs to be clicked?"
+            # Modified query to detect both checkbox and visual challenges
+            visual_captcha_query = "Is this a CAPTCHA challenge? This could be either a checkbox that needs to be clicked OR a visual challenge with images to select from."
             see_response = await self.see(visual_captcha_query, screenshot_data=screenshot_data)
             
-            # If no CAPTCHA detected, return early
             if not see_response.get("matches", False):
                 if self.verbose:
                     print("No CAPTCHA challenge detected.")
@@ -1463,284 +1449,139 @@ class CoffeeBlackSDK:
             if self.verbose:
                 print("CAPTCHA challenge detected!")
             
-            # Click the "I'm not a robot" checkbox if requested
-            if click_checkbox_first:
-                if self.verbose:
-                    print("Clicking the 'I'm not a robot' checkbox...")
-                
-                try:
-                    checkbox_response = await self.execute_action("Click the 'I'm not a robot' checkbox")
-                    
-                    # Wait for any animations
-                    if self.verbose:
-                        print(f"Waiting {checkbox_wait_time} seconds for animations...")
-                    await asyncio.sleep(checkbox_wait_time)
-                    
-                    # Get a new screenshot after clicking
-                    screenshot_data = await self.get_screenshot()
-                except Exception as e:
-                    error_msg = f"Failed to click CAPTCHA checkbox: {e}"
-                    if self.verbose:
-                        print(f"Warning: {error_msg}")
-                    return {
-                        "status": "error",
-                        "error": error_msg
-                    }
-            
-            # Check if we need to solve a visual challenge
-            challenge_query = "Is there a visual challenge that needs to be solved? This would be the case where the checkbox click did not work and a pop up has appeared."
-            challenge_response = await self.see(challenge_query, screenshot_data=screenshot_data)
-            
-            if not challenge_response.get("matches", False):
-                if self.verbose:
-                    print("CAPTCHA checkbox accepted, no visual challenge needed.")
-                return {
-                    "status": "success",
-                    "message": "CAPTCHA checkbox accepted without visual challenge."
-                }
-            
-            # Visual challenge detected, solve it
-            if self.verbose:
-                print("Visual challenge detected, solving...")
-            
             # Call the API to solve the visual challenge
-            # API URL for the captcha endpoint
             url = f"{self.base_url}/api/captcha"
-            
-            # Save the screenshot data to a temporary file
-            screenshot_path = None
-            using_temp_file = False
             timestamp = int(time.time())
             
-            try:
-                # Save the screenshot data to a temporary file
-                screenshot_path = f"{self.debug_dir}/captcha_screenshot_{timestamp}.png"
-                with open(screenshot_path, 'wb') as f:
-                    f.write(screenshot_data)
-                using_temp_file = True
+            # Send request to API
+            async with aiohttp.ClientSession() as session:
+                data = aiohttp.FormData()
+                data.add_field('max_attempts', str(max_attempts))
+                data.add_field('file', screenshot_data, filename='captcha.png', content_type='image/png')
                 
-                # Get the screenshot filename for the form data
-                screenshot_filename = os.path.basename(screenshot_path)
+                headers = {}
+                if self.api_key:
+                    headers['Authorization'] = f'Bearer {self.api_key}'
                 
-                # Log request details
-                if self.debug_enabled:
-                    request_debug = {
-                        'url': url,
-                        'max_attempts': max_attempts,
-                        'screenshot': screenshot_filename,
-                        'timestamp': timestamp
+                success, response_text, error_message = await self._make_api_request_with_retry(
+                    session=session,
+                    url=url,
+                    data=data,
+                    headers=headers,
+                    debug_prefix="captcha",
+                    timestamp=timestamp
+                )
+                
+                if not success:
+                    return {
+                        "status": "error",
+                        "error": error_message
                     }
-                    debug.log_debug(self.debug_dir, "0", request_debug, "captcha_request")
                 
-                # Send request to API
-                async with aiohttp.ClientSession() as session:
-                    # Create form data
-                    data = aiohttp.FormData()
-                    data.add_field('max_attempts', str(max_attempts))
-                    
-                    # Read screenshot into memory before adding to form data
-                    with open(screenshot_path, 'rb') as f:
-                        screenshot_content = f.read()
-                    
-                    # Add screenshot using the binary content
-                    data.add_field('file', 
-                                  screenshot_content, 
-                                  filename=screenshot_filename,
-                                  content_type='image/png')
-                    
-                    # Create headers with Authorization if API key is provided
-                    headers = {}
-                    if self.api_key:
-                        headers['Authorization'] = f'Bearer {self.api_key}'
-                    
-                    # Use the retry utility method
-                    success, response_text, error_message = await self._make_api_request_with_retry(
-                        session=session,
-                        url=url,
-                        data=data,
-                        headers=headers,
-                        debug_prefix="captcha",
-                        timestamp=timestamp
-                    )
-                    
-                    if not success:
-                        if self.verbose:
-                            print(f"Warning: CAPTCHA solving failed: {error_message}")
-                        
-                        # Return a detailed error response
-                        return {
-                            "status": "error",
-                            "error": error_message
-                        }
-                    
-                    # Parse response
-                    try:
-                        result = json.loads(response_text)
-                    except json.JSONDecodeError:
-                        error_msg = f"Failed to parse response as JSON. Response saved to {self.debug_dir}/captcha_response_raw_{timestamp}.txt"
-                        if self.verbose:
-                            print(f"Warning: {error_msg}")
-                        
-                        # Save the raw response for debugging
-                        with open(f'{self.debug_dir}/captcha_response_raw_{timestamp}.txt', 'w') as f:
-                            f.write(response_text)
-                        
-                        return {
-                            "status": "error",
-                            "error": error_msg
-                        }
-                    
-                    # Log parsed response
-                    if self.debug_enabled:
-                        with open(f'{self.debug_dir}/captcha_response_{timestamp}.json', 'w') as f:
-                            json.dump(result, f, indent=2)
-                    
-                    if self.verbose:
-                        # Print key information
-                        print(f"CAPTCHA Solution: Status={result.get('status', 'unknown')}")
-                        if 'captchaAnalysis' in result:
-                            analysis = result['captchaAnalysis']
-                            print(f"CAPTCHA Type: {analysis.get('actionType', 'unknown')}")
-                            print(f"Instructions: {analysis.get('instructions', 'unknown')}")
-                    
-                    # Add our enhanced metadata to the result
+                try:
+                    result = json.loads(response_text)
                     result["captchaDetectionMethod"] = "automatic"
                     
-                    # Apply solution by clicking on the coordinates if requested
+                    # If we got coordinates and apply_solution is True, we need to click them
                     if apply_solution and result.get("status") == "success":
-                        try:
+                        solution_data = result.get("solution", {})
+                        coordinates = solution_data.get("coordinates", [])
+                        
+                        if coordinates:
                             if self.verbose:
-                                print("Applying CAPTCHA solution by clicking on the coordinates...")
+                                print(f"Found {len(coordinates)} coordinates to click")
                             
-                            # Get coordinates from the solution
-                            solution_data = result.get("solution", {})
-                            coordinates = solution_data.get("coordinates", [])
+                            # Get window bounds and DPI scaling for coordinate translation
+                            window_bounds = None
+                            dpi_scaling = 1.0
+                            if self.active_window:
+                                window_bounds = self.active_window.bounds
+                                # Get DPI scaling for the window's display
+                                dpi_scaling = self.active_window.get_dpi_scaling()
+                                if self.verbose:
+                                    print(f"Window DPI scaling: {dpi_scaling}")
                             
-                            if not coordinates:
+                            # Validate and process coordinates
+                            processed_coordinates = []
+                            for i, coord in enumerate(coordinates):
+                                # Validate coordinate format
+                                if not isinstance(coord, dict) or 'x' not in coord or 'y' not in coord:
+                                    print(f"Warning: Invalid coordinate format at index {i}: {coord}")
+                                    continue
+                                
+                                x, y = coord.get("x"), coord.get("y")
+                                if not isinstance(x, (int, float)) or not isinstance(y, (int, float)):
+                                    print(f"Warning: Invalid coordinate values at index {i}: x={x}, y={y}")
+                                    continue
+                                
+                                # Apply DPI scaling
+                                x = int(x * dpi_scaling)
+                                y = int(y * dpi_scaling)
+                                
+                                # Apply window offset if needed
+                                if window_bounds:
+                                    x += window_bounds["x"]
+                                    y += window_bounds["y"]
+                                
+                                processed_coordinates.append({"x": x, "y": y})
+                                
                                 if self.verbose:
-                                    print("No coordinates found in the solution.")
-                                result["click_status"] = "no_coordinates"
-                            else:
-                                if self.verbose:
-                                    print(f"Found {len(coordinates)} coordinates to click on.")
-                                
-                                # Get window bounds for coordinate translation
-                                window_bounds = None
-                                if self.active_window:
-                                    window_bounds = self.active_window.bounds
-                                    
-                                # Debug log
-                                if self.verbose:
-                                    print(f"Window bounds: {window_bounds}")
-                                    print(f"Raw coordinates: {coordinates}")
-                                
-                                # Click on each coordinate
-                                for i, coord in enumerate(coordinates):
-                                    try:
-                                        # Extract x, y from coordinate object
-                                        x = coord.get("x")
-                                        y = coord.get("y")
-                                        
-                                        if x is None or y is None:
-                                            if self.verbose:
-                                                print(f"Warning: Invalid coordinate format for item {i}: {coord}")
-                                            continue
-                                        
-                                        # Apply window offset if we have active window bounds
-                                        if window_bounds:
-                                            window_x = window_bounds["x"]
-                                            window_y = window_bounds["y"]
-                                            screen_x = window_x + x
-                                            screen_y = window_y + y
-                                        else:
-                                            # Use coordinates as-is if no window bounds
-                                            screen_x = x
-                                            screen_y = y
-                                        
-                                        if self.verbose:
-                                            print(f"Clicking on coordinate {i+1}: ({x}, {y}) -> screen position: ({screen_x}, {screen_y})")
-                                        
-                                        # Perform the click
-                                        pyautogui.moveTo(screen_x, screen_y, duration=0.3)
-                                        pyautogui.click()
-                                        
-                                        # Small pause between clicks if there are multiple
-                                        if i < len(coordinates) - 1:
-                                            await asyncio.sleep(click_delay)
-                                            
-                                    except Exception as e:
-                                        if self.verbose:
-                                            print(f"Error clicking coordinate {i+1}: {e}")
-                                
-                                # Short wait after clicking all coordinates
-                                await asyncio.sleep(1.0)
-                                
-                                # Get a follow-up screenshot to verify the result
-                                try:
-                                    final_screenshot = await self.get_screenshot()
-                                    if self.debug_enabled:
-                                        final_path = f"{self.debug_dir}/captcha_after_click_{timestamp}.png"
-                                        with open(final_path, 'wb') as f:
-                                            f.write(final_screenshot)
-                                except Exception as e:
-                                    if self.verbose:
-                                        print(f"Warning: Failed to capture post-click screenshot: {e}")
-                                
-                                # Mark as successful
-                                result["click_status"] = "success"
-                                result["click_details"] = {
-                                    "coordinates_clicked": len(coordinates),
-                                    "window_offset_applied": window_bounds is not None
+                                    print(f"Processing coordinate {i+1}: original=({coord['x']}, {coord['y']}), scaled=({x}, {y})")
+                            
+                            if not processed_coordinates:
+                                return {
+                                    "status": "error",
+                                    "error": "No valid coordinates found in the solution"
                                 }
-                                
+                            
+                            # Click each coordinate
+                            for i, coord in enumerate(processed_coordinates):
                                 if self.verbose:
-                                    print("Successfully applied CAPTCHA solution.")
-                        except Exception as e:
-                            error_msg = f"Error applying CAPTCHA solution: {str(e)}"
+                                    print(f"Clicking coordinate {i+1}: ({coord['x']}, {coord['y']})")
+                                
+                                # Click the coordinate
+                                pyautogui.moveTo(coord['x'], coord['y'], duration=0.3)
+                                pyautogui.click()
+                                
+                                # Wait between clicks
+                                if i < len(processed_coordinates) - 1:
+                                    await asyncio.sleep(click_delay)
+                            
+                            # Short wait after clicking all coordinates
+                            await asyncio.sleep(1.0)
+                            
+                            # Now click the verify/submit button
+                            verify_result = await self.execute_action(
+                                "Click the 'Verify' or 'Submit' button to complete the CAPTCHA"
+                            )
+                            
+                            # Add verify button click status and coordinate details to result
+                            result["verify_button_clicked"] = verify_result.get("success", False)
+                            result["click_details"] = {
+                                "coordinates_clicked": len(processed_coordinates),
+                                "dpi_scaling_applied": dpi_scaling,
+                                "window_offset_applied": bool(window_bounds),
+                                "processed_coordinates": processed_coordinates
+                            }
+                            
                             if self.verbose:
-                                print(f"Warning: {error_msg}")
-                                traceback.print_exc()
-                            result["click_status"] = "error"
-                            result["click_error"] = error_msg
+                                if result["verify_button_clicked"]:
+                                    print("Successfully clicked verify button")
+                                else:
+                                    print("Failed to click verify button")
                     
                     return result
-                
-            except Exception as e:
-                error_msg = f"Unexpected error in CAPTCHA solving: {str(e)}"
-                if self.verbose:
-                    print(f"Warning: {error_msg}")
-                    traceback.print_exc()
-                
-                # Log the error
-                if self.debug_enabled:
-                    with open(f'{self.debug_dir}/captcha_error_{timestamp}.txt', 'w') as f:
-                        f.write(error_msg)
-                        f.write("\n\n")
-                        f.write(traceback.format_exc())
-                
-                return {
-                    "status": "error",
-                    "error": error_msg
-                }
-            finally:
-                # Clean up temporary files
-                if using_temp_file and screenshot_path and os.path.exists(screenshot_path):
-                    try:
-                        os.remove(screenshot_path)
-                    except Exception as e:
-                        # Just log the error but don't propagate it
-                        if self.verbose:
-                            print(f"Warning: Failed to remove temporary file {screenshot_path}: {e}")
-            
+                    
+                except json.JSONDecodeError:
+                    return {
+                        "status": "error",
+                        "error": "Failed to parse API response as JSON"
+                    }
+        
         except Exception as e:
-            error_msg = f"Unexpected error in CAPTCHA detection and solving: {str(e)}"
-            if self.verbose:
-                print(f"Warning: {error_msg}")
-                traceback.print_exc()
-            
             return {
                 "status": "error",
-                "error": error_msg
+                "error": str(e)
             }
 
     async def load_reference_element(self, file_path: str) -> bytes:
