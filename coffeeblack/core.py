@@ -292,7 +292,13 @@ class CoffeeBlackSDK:
                            model: Optional[str] = "ui-detect",
                            max_tokens: Optional[int] = None,
                            reference_element: Optional[Union[str, bytes]] = None,
-                           container_conf: Optional[float] = None) -> CoffeeBlackResponse:
+                           container_conf: Optional[float] = None,
+                           iou_threshold: Optional[float] = None,
+                           detection_sensitivity: Optional[float] = None,
+                           elements: Optional[str] = None,
+                           skip_image_for_static: Optional[bool] = None,
+                           temperature: Optional[float] = None,
+                           device_type: Optional[str] = None) -> CoffeeBlackResponse:
         """
         Execute a natural language query on the API and optionally execute the chosen action.
         
@@ -300,10 +306,16 @@ class CoffeeBlackSDK:
             query: Natural language query
             elements_conf: Optional override for element detection confidence (0.0-1.0)
             rows_conf: Optional override for row detection confidence (0.0-1.0)
-            model: Optional override for UI detection model ("cua", "ui-detect", or "ui-tars")
+            model: Optional override for UI detection model ("cua", "ui-detect", "ui-tars", "oai-cua", "bytedance-research/UI-TARS-7B-DPO")
             max_tokens: Optional maximum number of tokens for model generation (UI-TARS only)
             reference_element: Optional image data (bytes) or file path (str) of a reference UI element to help with detection
             container_conf: Optional override for container detection confidence (0.0-1.0)
+            iou_threshold: Optional Intersection over Union threshold (0.0-1.0)
+            detection_sensitivity: Optional single value to adjust all confidence parameters
+            elements: Optional JSON string containing element information
+            skip_image_for_static: Optional boolean to skip image processing for static commands
+            temperature: Optional temperature parameter for UI-TARS/CUA models (0.0-1.0)
+            device_type: Optional device type ("desktop" or "mobile")
             
         Returns:
             CoffeeBlackResponse with the API response
@@ -311,6 +323,7 @@ class CoffeeBlackSDK:
         Raises:
             ValueError: If no active window is attached
             ValueError: If invalid model is specified
+            ValueError: If invalid confidence thresholds are provided
             RuntimeError: If the API request fails
         """
         # Check if we have an active window
@@ -325,7 +338,7 @@ class CoffeeBlackSDK:
         selected_model = model if model is not None else self.model
         
         # Validate model selection if provided
-        valid_models = ["cua", "ui-detect", "ui-tars"]
+        valid_models = ["cua", "ui-detect", "ui-tars", "oai-cua", "bytedance-research/UI-TARS-7B-DPO"]
         if selected_model not in valid_models:
             raise ValueError(f"Model must be one of: {', '.join(valid_models)}")
         
@@ -336,19 +349,16 @@ class CoffeeBlackSDK:
             raise ValueError("rows_conf must be between 0.0 and 1.0")
         if container_conf is not None and not 0.0 <= container_conf <= 1.0:
             raise ValueError("container_conf must be between 0.0 and 1.0")
-
-        # Validate model selection if provided
-        valid_models = ["cua", "ui-detect", "ui-tars", "oai-cua"]
-        if selected_model not in valid_models:
-            raise ValueError(f"Model must be one of: {', '.join(valid_models)}")
+        if iou_threshold is not None and not 0.0 <= iou_threshold <= 1.0:
+            raise ValueError("iou_threshold must be between 0.0 and 1.0")
+        if detection_sensitivity is not None and not 0.0 <= detection_sensitivity <= 1.0:
+            raise ValueError("detection_sensitivity must be between 0.0 and 1.0")
+        if temperature is not None and not 0.0 <= temperature <= 1.0:
+            raise ValueError("temperature must be between 0.0 and 1.0")
             
-        # Validate confidence thresholds
-        if not 0.0 <= elements_conf <= 1.0:
-            raise ValueError("elements_conf must be between 0.0 and 1.0")
-        if not 0.0 <= rows_conf <= 1.0:
-            raise ValueError("rows_conf must be between 0.0 and 1.0")
-        if container_conf is not None and not 0.0 <= container_conf <= 1.0:
-            raise ValueError("container_conf must be between 0.0 and 1.0")
+        # Validate device type if provided
+        if device_type is not None and device_type not in ["desktop", "mobile"]:
+            raise ValueError("device_type must be either 'desktop' or 'mobile'")
 
         # Always take a fresh screenshot - this is essential for accurate coordinates
         # especially after scrolling operations
@@ -394,6 +404,12 @@ class CoffeeBlackSDK:
                     'model': selected_model,
                     'reference_element': 'reference_element.png' if using_reference_element else None,
                     'container_conf': container_conf,
+                    'iou_threshold': iou_threshold,
+                    'detection_sensitivity': detection_sensitivity,
+                    'elements': elements,
+                    'skip_image_for_static': skip_image_for_static,
+                    'temperature': temperature,
+                    'device_type': device_type,
                     'timestamp': timestamp
                 }
                 debug.log_debug(self.debug_dir, "0", request_debug, "request")
@@ -414,6 +430,22 @@ class CoffeeBlackSDK:
                     if container_conf is not None:
                         data.add_field('container_conf', str(container_conf))
                     
+                    # Add IOU threshold if provided
+                    if iou_threshold is not None:
+                        data.add_field('iou_threshold', str(iou_threshold))
+                    
+                    # Add detection sensitivity if provided
+                    if detection_sensitivity is not None:
+                        data.add_field('detection_sensitivity', str(detection_sensitivity))
+                    
+                    # Add elements JSON if provided
+                    if elements is not None:
+                        data.add_field('elements', elements)
+                    
+                    # Add skip_image_for_static if provided
+                    if skip_image_for_static is not None:
+                        data.add_field('skip_image_for_static', str(skip_image_for_static).lower())
+                    
                     # Add reference element if provided
                     if using_reference_element:
                         data.add_field('reference_element', 
@@ -426,11 +458,23 @@ class CoffeeBlackSDK:
                         print("\n=== API Request Parameters ===")
                         print(f"Query: {query}")
                         print(f"Screenshot: {os.path.basename(screenshot_path)}")
-                        print(f"element_conf: {elements_conf}")  # Note: Using plural in SDK but singular in request
-                        print(f"row_conf: {rows_conf}")         # Note: Using plural in SDK but singular in request
+                        print(f"element_conf: {elements_conf}")
+                        print(f"row_conf: {rows_conf}")
                         if container_conf is not None:
                             print(f"container_conf: {container_conf}")
+                        if iou_threshold is not None:
+                            print(f"iou_threshold: {iou_threshold}")
+                        if detection_sensitivity is not None:
+                            print(f"detection_sensitivity: {detection_sensitivity}")
+                        if elements is not None:
+                            print(f"elements: {elements}")
+                        if skip_image_for_static is not None:
+                            print(f"skip_image_for_static: {skip_image_for_static}")
                         print(f"model: {selected_model}")
+                        if temperature is not None:
+                            print(f"temperature: {temperature}")
+                        if device_type is not None:
+                            print(f"device_type: {device_type}")
                         if using_reference_element:
                             print(f"reference_element: reference_element.png")
                         print("=============================\n")
@@ -439,9 +483,17 @@ class CoffeeBlackSDK:
                     data.add_field('model', selected_model)
                     
                     # Add max_tokens parameter if provided (UI-TARS only)
-                    if selected_model == "ui-tars":
+                    if selected_model in ["ui-tars", "bytedance-research/UI-TARS-7B-DPO"]:
                         tokens = max_tokens if max_tokens is not None else self.max_tokens
                         data.add_field('max_tokens', str(tokens))
+                    
+                    # Add temperature if provided (UI-TARS/CUA only)
+                    if temperature is not None and selected_model in ["ui-tars", "bytedance-research/UI-TARS-7B-DPO", "cua", "oai-cua"]:
+                        data.add_field('temperature', str(temperature))
+                    
+                    # Add device_type if provided
+                    if device_type is not None:
+                        data.add_field('device_type', device_type)
                     
                     # Add additional options if using experimental features
                     if self.use_hierarchical_indexing:
@@ -1448,6 +1500,32 @@ class CoffeeBlackSDK:
             
             if self.verbose:
                 print("CAPTCHA challenge detected!")
+            
+            # If click_checkbox_first is True, try to find and click the checkbox first
+            if click_checkbox_first:
+                if self.verbose:
+                    print("Attempting to find and click the CAPTCHA checkbox...")
+                
+                # Use execute_action to find and click the checkbox
+                checkbox_result = await self.execute_action(
+                    "Click the 'I am not a robot' checkbox or reCAPTCHA checkbox",
+                    elements_conf=0.3  # Lower confidence threshold for checkbox detection
+                )
+                
+                if checkbox_result.chosen_action and checkbox_result.chosen_element_index is not None:
+                    if self.verbose:
+                        print("Successfully clicked the checkbox")
+                    
+                    # Wait for animations to complete
+                    if self.verbose:
+                        print(f"Waiting {checkbox_wait_time} seconds for animations to complete...")
+                    await asyncio.sleep(checkbox_wait_time)
+                    
+                    # Take a new screenshot after clicking the checkbox
+                    screenshot_data = await self.get_screenshot()
+                else:
+                    if self.verbose:
+                        print("Could not find the checkbox, continuing with visual challenge detection")
             
             # Call the API to solve the visual challenge
             url = f"{self.base_url}/api/captcha"
