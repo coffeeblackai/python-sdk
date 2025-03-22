@@ -19,7 +19,7 @@ async def main():
         debug_enabled=True,
         elements_conf=0.2,
         rows_conf=0.4,
-        model="ui-detect"  # Set the UI detection model to use (cua, ui-detect, or ui-tars)
+        model="ui-tars"  # Set the UI detection model to use (cua, ui-detect, or ui-tars)
     )
     
     # Define the browser name

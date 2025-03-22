@@ -131,40 +131,41 @@ class AppManager:
         """
         Scan for applications on macOS
         """
-        # Check the main Applications folder
-        applications_path = "/Applications"
-        if os.path.exists(applications_path):
-            for item in os.listdir(applications_path):
-                if item.endswith(".app"):
-                    app_path = os.path.join(applications_path, item)
-                    app_name = item.replace(".app", "")
-                    
-                    # Try to get more info from Info.plist
-                    plist_path = os.path.join(app_path, "Contents", "Info.plist")
-                    category = None
-                    description = None
-                    
-                    if os.path.exists(plist_path):
-                        try:
-                            # Use plutil to convert to JSON (macOS-specific)
-                            result = subprocess.run(
-                                ["plutil", "-convert", "json", "-o", "-", plist_path],
-                                capture_output=True,
-                                text=True
-                            )
-                            if result.returncode == 0:
-                                plist_data = json.loads(result.stdout)
-                                category = plist_data.get("LSApplicationCategoryType", "").replace("public.", "")
-                                description = plist_data.get("CFBundleGetInfoString", app_name)
-                        except Exception as e:
-                            logger.debug(f"Error reading Info.plist for {app_name}: {e}")
-                    
-                    self.apps[app_name.lower()] = AppInfo(
-                        name=app_name,
-                        path=app_path,
-                        description=description or app_name,
-                        category=category
-                    )
+        # Check the main Applications folders
+        application_paths = ["/Applications", "/System/Applications"]
+        for applications_path in application_paths:
+            if os.path.exists(applications_path):
+                for item in os.listdir(applications_path):
+                    if item.endswith(".app"):
+                        app_path = os.path.join(applications_path, item)
+                        app_name = item.replace(".app", "")
+                        
+                        # Try to get more info from Info.plist
+                        plist_path = os.path.join(app_path, "Contents", "Info.plist")
+                        category = None
+                        description = None
+                        
+                        if os.path.exists(plist_path):
+                            try:
+                                # Use plutil to convert to JSON (macOS-specific)
+                                result = subprocess.run(
+                                    ["plutil", "-convert", "json", "-o", "-", plist_path],
+                                    capture_output=True,
+                                    text=True
+                                )
+                                if result.returncode == 0:
+                                    plist_data = json.loads(result.stdout)
+                                    category = plist_data.get("LSApplicationCategoryType", "").replace("public.", "")
+                                    description = plist_data.get("CFBundleGetInfoString", app_name)
+                            except Exception as e:
+                                logger.debug(f"Error reading Info.plist for {app_name}: {e}")
+                        
+                        self.apps[app_name.lower()] = AppInfo(
+                            name=app_name,
+                            path=app_path,
+                            description=description or app_name,
+                            category=category
+                        )
         
         # Also check user applications folder
         user_applications = os.path.expanduser("~/Applications")
@@ -294,17 +295,52 @@ class AppManager:
         except Exception as e:
             logger.warning(f"Error generating embeddings: {e}")
     
-    def find_app(self, query: str, threshold: float = 0.3) -> List[Tuple[AppInfo, float]]:
+    def find_app(self, query: str, threshold: float = 0.3, path: Optional[str] = None) -> List[Tuple[AppInfo, float]]:
         """
         Find applications matching the query using semantic search or basic matching
         
         Args:
             query: Natural language query (e.g., "web browser", "Safari", "text editor")
             threshold: Similarity threshold (0-1) for semantic search matches
+            path: Optional direct path to an application. If provided, this takes precedence over query.
             
         Returns:
             List of tuples (AppInfo, score) sorted by relevance
         """
+        # If a direct path is provided, use it
+        if path:
+            normalized_path = path.replace('\\ ', ' ')
+            if os.path.exists(normalized_path) and ((normalized_path.endswith('.app') and self.system == "Darwin") or 
+                                                 (normalized_path.endswith('.exe') and self.system == "Windows")):
+                app_name = os.path.basename(normalized_path).replace('.app', '').replace('.exe', '')
+                if app_name.lower() not in self.apps:
+                    self._register_app_from_path(normalized_path)
+                
+                if app_name.lower() in self.apps:
+                    return [(self.apps[app_name.lower()], 1.0)]
+        
+        # Handle path detection in query - normalizing the path
+        normalized_query = query
+        
+        # If the query contains escaped spaces, normalize it
+        if '\\' in query:
+            normalized_query = query.replace('\\ ', ' ')
+        
+        # Check if the query is an actual path to an application
+        path_exists = os.path.exists(normalized_query)
+        is_app = (self.system == "Darwin" and normalized_query.endswith('.app')) or \
+                (self.system == "Windows" and normalized_query.endswith('.exe'))
+        
+        if path_exists and is_app:
+            # Register this app if it's not already in our list
+            app_name = os.path.basename(normalized_query).replace('.app', '').replace('.exe', '')
+            if app_name.lower() not in self.apps:
+                self._register_app_from_path(normalized_query)
+            
+            # Return it with a perfect score
+            if app_name.lower() in self.apps:
+                return [(self.apps[app_name.lower()], 1.0)]
+        
         # First, try exact matching by name
         query_lower = query.lower()
         if query_lower in self.apps:
@@ -352,12 +388,91 @@ class AppManager:
         results.sort(key=lambda x: x[1], reverse=True)
         return results
     
-    def open_app(self, query: str) -> Tuple[bool, str]:
+    def _register_app_from_path(self, app_path: str) -> AppInfo:
         """
-        Find and open an application using natural language
+        Register an application from its full path
+        
+        Args:
+            app_path: Full path to the application
+            
+        Returns:
+            The AppInfo object for the registered app
+        """
+        if not os.path.exists(app_path):
+            raise FileNotFoundError(f"App path does not exist: {app_path}")
+        
+        if self.system == "Darwin" and app_path.endswith('.app'):
+            app_name = os.path.basename(app_path).replace('.app', '')
+            
+            # Try to get more info from Info.plist
+            plist_path = os.path.join(app_path, "Contents", "Info.plist")
+            category = None
+            description = None
+            
+            if os.path.exists(plist_path):
+                try:
+                    # Use plutil to convert to JSON (macOS-specific)
+                    result = subprocess.run(
+                        ["plutil", "-convert", "json", "-o", "-", plist_path],
+                        capture_output=True,
+                        text=True
+                    )
+                    if result.returncode == 0:
+                        plist_data = json.loads(result.stdout)
+                        category = plist_data.get("LSApplicationCategoryType", "").replace("public.", "")
+                        description = plist_data.get("CFBundleGetInfoString", app_name)
+                except Exception as e:
+                    logger.debug(f"Error reading Info.plist for {app_name}: {e}")
+            
+        elif self.system == "Windows" and app_path.endswith('.exe'):
+            app_name = os.path.basename(app_path).replace('.exe', '')
+            description = app_name
+            category = None
+            
+        elif self.system == "Linux":
+            app_name = os.path.basename(app_path)
+            description = app_name
+            category = None
+            
+        else:
+            app_name = os.path.basename(app_path)
+            description = app_name
+            category = None
+        
+        app_info = AppInfo(
+            name=app_name,
+            path=app_path,
+            description=description or app_name,
+            category=category
+        )
+        
+        # Add to our apps dictionary
+        self.apps[app_name.lower()] = app_info
+        
+        # If we're using embeddings, generate embedding for this app
+        if self.use_embeddings and self.model:
+            text = f"{app_info.name}"
+            if app_info.description and app_info.description != app_info.name:
+                text += f" - {app_info.description}"
+            if app_info.category:
+                text += f" ({app_info.category})"
+            
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    app_info.embedding = self.model.encode(text, convert_to_tensor=True, show_progress_bar=False)
+            except Exception as e:
+                logger.debug(f"Error generating embedding for {app_name}: {e}")
+        
+        return app_info
+    
+    def open_app(self, query: str, path: Optional[str] = None) -> Tuple[bool, str]:
+        """
+        Find and open an application using natural language or direct path
         
         Args:
             query: Natural language query (e.g., "open Safari", "launch Chrome")
+            path: Optional direct path to an application. If provided, this takes precedence over query.
             
         Returns:
             Tuple of (success, message)
@@ -369,8 +484,8 @@ class AppManager:
                 clean_query = clean_query[len(prefix):]
                 break
         
-        # Find matching apps
-        matching_apps = self.find_app(clean_query)
+        # Find matching apps, prioritizing path if provided
+        matching_apps = self.find_app(clean_query, path=path)
         
         if not matching_apps:
             return False, f"Could not find any application matching '{clean_query}'"
@@ -391,16 +506,23 @@ class AppManager:
         except Exception as e:
             return False, f"Error opening {best_match.name}: {str(e)}"
     
-    def get_app_info(self, app_name: str) -> Optional[AppInfo]:
+    def get_app_info(self, app_name: str, path: Optional[str] = None) -> Optional[AppInfo]:
         """
         Get information about a specific application
         
         Args:
             app_name: Name of the application
+            path: Optional direct path to an application. If provided, this takes precedence.
             
         Returns:
             AppInfo object or None if not found
         """
+        # If a direct path is provided, try to find or register the app
+        if path:
+            matches = self.find_app("", path=path)
+            if matches:
+                return matches[0][0]
+        
         app_name_lower = app_name.lower()
         
         # Try exact match first
@@ -411,17 +533,18 @@ class AppManager:
         matches = self.find_app(app_name)
         return matches[0][0] if matches else None
     
-    def is_app_installed(self, app_name: str) -> bool:
+    def is_app_installed(self, app_name: str, path: Optional[str] = None) -> bool:
         """
         Check if an application is installed
         
         Args:
             app_name: Name of the application
+            path: Optional direct path to an application
             
         Returns:
             True if installed, False otherwise
         """
-        return self.get_app_info(app_name) is not None
+        return self.get_app_info(app_name, path=path) is not None
     
     def get_all_apps(self) -> List[AppInfo]:
         """

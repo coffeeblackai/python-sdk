@@ -198,7 +198,7 @@ class CoffeeBlackSDK:
         target_window = window.find_window_by_name(query)
         await self.attach_to_window(target_window.id)
         
-    async def open_app(self, query: str) -> Tuple[bool, str]:
+    async def open_app(self, query: str, path: str = None) -> Tuple[bool, str]:
         """
         Find and open an application using natural language query.
         
@@ -208,10 +208,10 @@ class CoffeeBlackSDK:
         Returns:
             Tuple of (success, message)
         """
-        success, message = self.app_manager.open_app(query)
+        success, message = self.app_manager.open_app(query, path=path)
         return success, message
     
-    async def open_and_attach_to_app(self, app_name: str, wait_time: float = 2.0) -> None:
+    async def open_and_attach_to_app(self, app_name: str, path: str = None, wait_time: float = 2.0) -> None:
         """
         Open an app with the specified name, wait for it to launch, and then attach to it.
         
@@ -226,7 +226,7 @@ class CoffeeBlackSDK:
         logger.info(f"Opening and attaching to {app_name}...")
         
         # Open the app
-        success, message = await self.open_app(app_name)
+        success, message = await self.open_app(app_name, path=path)
         if not success:
             raise ValueError(f"Failed to open {app_name}: {message}")
         
@@ -289,7 +289,7 @@ class CoffeeBlackSDK:
                            query: str, 
                            elements_conf: Optional[float] = None, 
                            rows_conf: Optional[float] = None,
-                           model: Optional[str] = None,
+                           model: Optional[str] = "ui-detect",
                            max_tokens: Optional[int] = None,
                            reference_element: Optional[Union[str, bytes]] = None,
                            container_conf: Optional[float] = None) -> CoffeeBlackResponse:
@@ -329,6 +329,19 @@ class CoffeeBlackSDK:
         if selected_model not in valid_models:
             raise ValueError(f"Model must be one of: {', '.join(valid_models)}")
         
+        # Validate confidence thresholds
+        if not 0.0 <= elements_conf <= 1.0:
+            raise ValueError("elements_conf must be between 0.0 and 1.0")
+        if not 0.0 <= rows_conf <= 1.0:
+            raise ValueError("rows_conf must be between 0.0 and 1.0")
+        if container_conf is not None and not 0.0 <= container_conf <= 1.0:
+            raise ValueError("container_conf must be between 0.0 and 1.0")
+
+        # Validate model selection if provided
+        valid_models = ["cua", "ui-detect", "ui-tars", "oai-cua"]
+        if selected_model not in valid_models:
+            raise ValueError(f"Model must be one of: {', '.join(valid_models)}")
+            
         # Validate confidence thresholds
         if not 0.0 <= elements_conf <= 1.0:
             raise ValueError("elements_conf must be between 0.0 and 1.0")
@@ -2284,3 +2297,295 @@ If the element IS NOT VISIBLE:
             print(f"Warning: {error_message}")
             
         return False, None, error_message 
+
+    async def embed(self, 
+                   images: List[Union[str, bytes]], 
+                   normalize: bool = False) -> Dict[str, Any]:
+        """
+        Generate embeddings for the provided images using the CoffeeBlack embeddings API.
+        
+        Args:
+            images: List of images as file paths (str) or raw image data (bytes)
+            normalize: Whether to normalize the embeddings (default: False)
+            
+        Returns:
+            Dictionary containing the embeddings and processing time:
+            {
+                "embeddings": List of embedding vectors,
+                "processing_time": Time taken to generate embeddings in seconds
+            }
+            
+        Raises:
+            ValueError: If no images are provided
+            RuntimeError: If the API request fails
+        """
+        if not images:
+            raise ValueError("No images provided for embedding")
+            
+        # API URL for the embeddings endpoint
+        url = f"{self.base_url}/api/embeddings"
+        
+        # Track temporary files to clean up later
+        temp_files = []
+        timestamp = int(time.time())
+        
+        try:
+            # Log request details
+            if self.debug_enabled:
+                request_debug = {
+                    'url': url,
+                    'normalize': normalize,
+                    'num_images': len(images),
+                    'timestamp': timestamp
+                }
+                debug.log_debug(self.debug_dir, "0", request_debug, "embed_request")
+            
+            # Send request to API
+            async with aiohttp.ClientSession() as session:
+                # Create form data
+                data = aiohttp.FormData()
+                data.add_field('normalize', str(normalize).lower())
+                
+                # Process each image and add to form data
+                for i, image in enumerate(images):
+                    if isinstance(image, str):
+                        # It's a file path
+                        if not os.path.exists(image):
+                            raise ValueError(f"Image file not found: {image}")
+                            
+                        with open(image, 'rb') as f:
+                            image_data = f.read()
+                            filename = os.path.basename(image)
+                    else:
+                        # It's raw image data
+                        image_data = image
+                        filename = f"image_{i}.png"  # Default filename
+                    
+                    # Add to form data
+                    data.add_field('files', 
+                                  image_data, 
+                                  filename=filename,
+                                  content_type='image/png')
+                
+                # Create headers with Authorization if API key is provided
+                headers = {}
+                if self.api_key:
+                    headers['Authorization'] = f'Bearer {self.api_key}'
+                
+                # Use the retry utility method
+                success, response_text, error_message = await self._make_api_request_with_retry(
+                    session=session,
+                    url=url,
+                    data=data,
+                    headers=headers,
+                    debug_prefix="embed",
+                    timestamp=timestamp
+                )
+                
+                if not success:
+                    raise RuntimeError(f"Failed to generate embeddings: {error_message}")
+                
+                # Parse response
+                try:
+                    result = json.loads(response_text)
+                except json.JSONDecodeError:
+                    raise RuntimeError(f"Failed to parse response as JSON. Response saved to {self.debug_dir}/embed_response_raw_{timestamp}.txt")
+                
+                # Log parsed response
+                if self.debug_enabled:
+                    with open(f'{self.debug_dir}/embed_response_{timestamp}.json', 'w') as f:
+                        json.dump(result, f, indent=2)
+                
+                # Return the embeddings result
+                return {
+                    "embeddings": result.get("embeddings", []),
+                    "processing_time": result.get("processing_time", 0)
+                }
+                
+        except Exception as e:
+            error_msg = f"Error generating embeddings: {str(e)}"
+            if self.verbose:
+                print(f"Warning: {error_msg}")
+                
+            # Log the error
+            if self.debug_enabled:
+                with open(f'{self.debug_dir}/embed_error_{timestamp}.txt', 'w') as f:
+                    f.write(error_msg)
+                    f.write("\n\n")
+                    f.write(traceback.format_exc())
+            
+            raise RuntimeError(error_msg) from e
+            
+        finally:
+            # Clean up any temporary files
+            for temp_file in temp_files:
+                if os.path.exists(temp_file):
+                    try:
+                        os.remove(temp_file)
+                    except Exception as e:
+                        if self.verbose:
+                            print(f"Warning: Failed to remove temporary file {temp_file}: {e}")
+
+    async def compare(self, 
+                     image1: Union[str, bytes],
+                     image2: Union[str, bytes],
+                     normalize: bool = True) -> Dict[str, Any]:
+        """
+        Compare two images by calculating the cosine distance between their embeddings.
+        
+        Args:
+            image1: First image as file path (str) or raw image data (bytes)
+            image2: Second image as file path (str) or raw image data (bytes)
+            normalize: Whether to normalize the embeddings (default: True)
+            
+        Returns:
+            Dictionary containing the comparison results:
+            {
+                "cosine_distance": Cosine distance between embeddings (0-2, where 0 means identical),
+                "cosine_similarity": Cosine similarity between embeddings (1 to -1, where 1 means identical),
+                "embeddings": List of embeddings for each image,
+                "processing_time": Total time taken for embedding and comparison
+            }
+            
+        Raises:
+            ValueError: If images couldn't be processed
+            RuntimeError: If the API request fails
+        """
+        import numpy as np
+        start_time = time.time()
+        
+        try:
+            # Get embeddings for both images
+            if self.verbose:
+                print("Getting embeddings for both images...")
+                
+            embed_result = await self.embed([image1, image2], normalize=normalize)
+            embeddings = embed_result.get("embeddings", [])
+            
+            if len(embeddings) != 2:
+                raise ValueError(f"Expected 2 embeddings, but got {len(embeddings)}")
+            
+            # Convert to numpy arrays for vector operations
+            embedding1 = np.array(embeddings[0])
+            embedding2 = np.array(embeddings[1])
+            
+            # Calculate cosine similarity
+            # Formula: cos_sim = dot(v1, v2) / (norm(v1) * norm(v2))
+            dot_product = np.dot(embedding1, embedding2)
+            norm1 = np.linalg.norm(embedding1)
+            norm2 = np.linalg.norm(embedding2)
+            
+            # Avoid division by zero
+            if norm1 == 0 or norm2 == 0:
+                cosine_similarity = 0
+            else:
+                cosine_similarity = dot_product / (norm1 * norm2)
+                
+            # Calculate cosine distance (1 - similarity)
+            # Range: 0 (identical) to 2 (completely opposite)
+            cosine_distance = 1 - cosine_similarity
+            
+            processing_time = time.time() - start_time
+            
+            if self.verbose:
+                print(f"Comparison complete: distance={cosine_distance:.4f}, similarity={cosine_similarity:.4f}")
+                
+            return {
+                "cosine_distance": float(cosine_distance),
+                "cosine_similarity": float(cosine_similarity),
+                "embeddings": embeddings,
+                "processing_time": processing_time
+            }
+            
+        except Exception as e:
+            error_msg = f"Error comparing images: {str(e)}"
+            if self.verbose:
+                print(f"Warning: {error_msg}")
+            raise RuntimeError(error_msg) from e
+            
+    async def compare_screenshots(self, 
+                                delay: float = 2.0,
+                                normalize: bool = True) -> Dict[str, Any]:
+        """
+        Take two screenshots with a specified delay between them and compare 
+        the visual difference by calculating the cosine distance between their embeddings.
+        
+        This is useful for detecting if a UI has changed after an action.
+        
+        Args:
+            delay: Time in seconds to wait between screenshots (default: 2.0)
+            normalize: Whether to normalize the embeddings (default: True)
+            
+        Returns:
+            Dictionary containing the comparison results:
+            {
+                "cosine_distance": Cosine distance between embeddings,
+                "cosine_similarity": Cosine similarity between embeddings,
+                "first_screenshot": Path to the first screenshot if debug is enabled,
+                "second_screenshot": Path to the second screenshot if debug is enabled,
+                "processing_time": Total time taken for the operation
+            }
+            
+        Raises:
+            ValueError: If no active window is attached
+            RuntimeError: If image comparison fails
+        """
+        start_time = time.time()
+        first_screenshot_path = None
+        second_screenshot_path = None
+        
+        try:
+            if not self.active_window:
+                raise ValueError("No active window to capture. Call attach_to_window first.")
+                
+            if self.verbose:
+                print(f"Taking first screenshot...")
+                
+            # Take first screenshot
+            screenshot1 = await self.get_screenshot()
+            
+            # Save debug copy if debug is enabled
+            if self.debug_enabled:
+                timestamp = int(time.time())
+                first_screenshot_path = f"{self.debug_dir}/compare_first_{timestamp}.png"
+                with open(first_screenshot_path, 'wb') as f:
+                    f.write(screenshot1)
+                    
+            # Wait for specified delay
+            if self.verbose:
+                print(f"Waiting {delay} seconds before taking second screenshot...")
+            await asyncio.sleep(delay)
+            
+            # Take second screenshot
+            if self.verbose:
+                print(f"Taking second screenshot...")
+            screenshot2 = await self.get_screenshot()
+            
+            # Save debug copy if debug is enabled
+            if self.debug_enabled:
+                timestamp = int(time.time())
+                second_screenshot_path = f"{self.debug_dir}/compare_second_{timestamp}.png"
+                with open(second_screenshot_path, 'wb') as f:
+                    f.write(screenshot2)
+                    
+            # Compare the screenshots
+            if self.verbose:
+                print(f"Comparing screenshots...")
+            compare_result = await self.compare(screenshot1, screenshot2, normalize=normalize)
+            
+            # Add screenshot paths to result if in debug mode
+            if self.debug_enabled:
+                compare_result["first_screenshot"] = first_screenshot_path
+                compare_result["second_screenshot"] = second_screenshot_path
+                
+            # Calculate total processing time
+            compare_result["total_processing_time"] = time.time() - start_time
+            
+            return compare_result
+            
+        except Exception as e:
+            error_msg = f"Error in compare_screenshots: {str(e)}"
+            if self.verbose:
+                print(f"Warning: {error_msg}")
+            raise RuntimeError(error_msg) from e
+            
