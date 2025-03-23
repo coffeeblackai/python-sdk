@@ -1446,7 +1446,8 @@ class CoffeeBlackSDK:
                            click_checkbox_first: bool = True,
                            checkbox_wait_time: float = 3.0,
                            apply_solution: bool = True,
-                           click_delay: float = 0.5) -> Dict[str, Any]:
+                           click_delay: float = 0.5,
+                           detection_sensitivity: float = 0.5) -> Dict[str, Any]:
         """
         Detect and solve a CAPTCHA challenge automatically.
         
@@ -1465,6 +1466,7 @@ class CoffeeBlackSDK:
             checkbox_wait_time: Time to wait after clicking the checkbox for animations (default: 3.0)
             apply_solution: Whether to automatically click on the solution coordinates (default: True)
             click_delay: Delay in seconds between clicks when multiple coordinates are returned (default: 0.5)
+            detection_sensitivity: Sensitivity for element detection (0.0-1.0, default: 0.5)
                 
         Returns:
             Dictionary containing the CAPTCHA solving results with fields:
@@ -1509,7 +1511,8 @@ class CoffeeBlackSDK:
                 # Use execute_action to find and click the checkbox
                 checkbox_result = await self.execute_action(
                     "Click the 'I am not a robot' checkbox or reCAPTCHA checkbox",
-                    elements_conf=0.3  # Lower confidence threshold for checkbox detection
+                    elements_conf=0.3,  # Lower confidence threshold for checkbox detection
+                    detection_sensitivity=detection_sensitivity
                 )
                 
                 if checkbox_result.chosen_action and checkbox_result.chosen_element_index is not None:
@@ -1630,7 +1633,8 @@ class CoffeeBlackSDK:
                             
                             # Now click the verify/submit button
                             verify_result = await self.execute_action(
-                                "Click the 'Verify' or 'Submit' button to complete the CAPTCHA"
+                                "Click the 'Verify' or 'Submit' button to complete the CAPTCHA",
+                                detection_sensitivity=detection_sensitivity
                             )
                             
                             # Add verify button click status and coordinate details to result
