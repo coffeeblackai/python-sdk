@@ -1571,86 +1571,131 @@ class CoffeeBlackSDK:
                         if coordinates:
                             if self.verbose:
                                 print(f"Found {len(coordinates)} coordinates to click")
+                                print("Starting coordinate processing...")
                             
-                            # Get window bounds and DPI scaling for coordinate translation
-                            window_bounds = None
-                            dpi_scaling = 1.0
-                            if self.active_window:
-                                window_bounds = self.active_window.bounds
-                                # Get DPI scaling for the window's display
-                                dpi_scaling = self.active_window.get_dpi_scaling()
+                            try:
+                                # Get window bounds and DPI scaling for coordinate translation
+                                window_bounds = None
+                                dpi_scaling = 1.0
+                                if self.active_window:
+                                    if self.verbose:
+                                        print("Getting window bounds and DPI scaling...")
+                                    window_bounds = self.active_window.bounds
+                                    # Get DPI scaling for the window's display
+                                    dpi_scaling = screenshot.detect_retina_dpi(target_bounds=window_bounds)
+                                    if self.verbose:
+                                        print(f"Window DPI scaling: {dpi_scaling}")
+                                else:
+                                    if self.verbose:
+                                        print("Warning: No active window found")
+                                
+                                # Validate and process coordinates
+                                processed_coordinates = []
                                 if self.verbose:
-                                    print(f"Window DPI scaling: {dpi_scaling}")
-                            
-                            # Validate and process coordinates
-                            processed_coordinates = []
-                            for i, coord in enumerate(coordinates):
-                                # Validate coordinate format
-                                if not isinstance(coord, dict) or 'x' not in coord or 'y' not in coord:
-                                    print(f"Warning: Invalid coordinate format at index {i}: {coord}")
-                                    continue
+                                    print("Starting coordinate validation and processing...")
                                 
-                                x, y = coord.get("x"), coord.get("y")
-                                if not isinstance(x, (int, float)) or not isinstance(y, (int, float)):
-                                    print(f"Warning: Invalid coordinate values at index {i}: x={x}, y={y}")
-                                    continue
+                                for i, coord in enumerate(coordinates):
+                                    if self.verbose:
+                                        print(f"Processing coordinate {i+1}: {coord}")
+                                    
+                                    try:
+                                        # Validate coordinate format
+                                        if not isinstance(coord, dict) or 'x' not in coord or 'y' not in coord:
+                                            print(f"Warning: Invalid coordinate format at index {i}: {coord}")
+                                            continue
+                                        
+                                        x, y = coord.get("x"), coord.get("y")
+                                        if not isinstance(x, (int, float)) or not isinstance(y, (int, float)):
+                                            print(f"Warning: Invalid coordinate values at index {i}: x={x}, y={y}")
+                                            continue
+                                        
+                                        # Apply DPI scaling
+                                        x = int(x * dpi_scaling)
+                                        y = int(y * dpi_scaling)
+                                        
+                                        # Apply window offset if needed
+                                        if window_bounds:
+                                            x += window_bounds["x"]
+                                            y += window_bounds["y"]
+                                        
+                                        processed_coordinates.append({"x": x, "y": y})
+                                        
+                                        if self.verbose:
+                                            print(f"Successfully processed coordinate {i+1}: original=({coord['x']}, {coord['y']}), scaled=({x}, {y})")
+                                            
+                                    except Exception as coord_error:
+                                        print(f"Error processing coordinate {i+1}: {str(coord_error)}")
+                                        if self.verbose:
+                                            import traceback
+                                            print(f"Coordinate processing error traceback: {traceback.format_exc()}")
+                                        continue
                                 
-                                # Apply DPI scaling
-                                x = int(x * dpi_scaling)
-                                y = int(y * dpi_scaling)
-                                
-                                # Apply window offset if needed
-                                if window_bounds:
-                                    x += window_bounds["x"]
-                                    y += window_bounds["y"]
-                                
-                                processed_coordinates.append({"x": x, "y": y})
+                                if not processed_coordinates:
+                                    if self.verbose:
+                                        print("No valid coordinates found after processing")
+                                    return {
+                                        "status": "error",
+                                        "error": "No valid coordinates found in the solution"
+                                    }
                                 
                                 if self.verbose:
-                                    print(f"Processing coordinate {i+1}: original=({coord['x']}, {coord['y']}), scaled=({x}, {y})")
-                            
-                            if not processed_coordinates:
+                                    print(f"Successfully processed {len(processed_coordinates)} coordinates")
+                                
+                                # Click each coordinate
+                                if self.verbose:
+                                    print(f"Starting to click {len(processed_coordinates)} coordinates")
+                                
+                                for i, coord in enumerate(processed_coordinates):
+                                    if self.verbose:
+                                        print(f"Clicking coordinate {i+1}: ({coord['x']}, {coord['y']})")
+                                    
+                                    # Click the coordinate
+                                    pyautogui.moveTo(coord['x'], coord['y'], duration=0.3)
+                                    pyautogui.click()
+                                    
+                                    # Wait between clicks
+                                    if i < len(processed_coordinates) - 1:
+                                        if self.verbose:
+                                            print(f"Waiting {click_delay} seconds before next click")
+                                        await asyncio.sleep(click_delay)
+                                
+                                # Short wait after clicking all coordinates
+                                if self.verbose:
+                                    print("Waiting 1 second after clicking all coordinates")
+                                await asyncio.sleep(1.0)
+                                
+                                # Now click the verify/submit button
+                                if self.verbose:
+                                    print("Attempting to click verify/submit button")
+                                verify_result = await self.execute_action(
+                                    "Click the 'Verify' or 'Submit' button to complete the CAPTCHA",
+                                    detection_sensitivity=detection_sensitivity
+                                )
+                                
+                                # Add verify button click status and coordinate details to result
+                                result["verify_button_clicked"] = verify_result.get("success", False)
+                                result["click_details"] = {
+                                    "coordinates_clicked": len(processed_coordinates),
+                                    "dpi_scaling_applied": dpi_scaling,
+                                    "window_offset_applied": bool(window_bounds),
+                                    "processed_coordinates": processed_coordinates
+                                }
+                                
+                                if self.verbose:
+                                    if result["verify_button_clicked"]:
+                                        print("Successfully clicked verify button")
+                                    else:
+                                        print("Failed to click verify button")
+                                
+                            except Exception as e:
+                                print(f"Error during coordinate processing: {str(e)}")
+                                if self.verbose:
+                                    import traceback
+                                    print(f"Coordinate processing error traceback: {traceback.format_exc()}")
                                 return {
                                     "status": "error",
-                                    "error": "No valid coordinates found in the solution"
+                                    "error": f"Failed to process coordinates: {str(e)}"
                                 }
-                            
-                            # Click each coordinate
-                            for i, coord in enumerate(processed_coordinates):
-                                if self.verbose:
-                                    print(f"Clicking coordinate {i+1}: ({coord['x']}, {coord['y']})")
-                                
-                                # Click the coordinate
-                                pyautogui.moveTo(coord['x'], coord['y'], duration=0.3)
-                                pyautogui.click()
-                                
-                                # Wait between clicks
-                                if i < len(processed_coordinates) - 1:
-                                    await asyncio.sleep(click_delay)
-                            
-                            # Short wait after clicking all coordinates
-                            await asyncio.sleep(1.0)
-                            
-                            # Now click the verify/submit button
-                            verify_result = await self.execute_action(
-                                "Click the 'Verify' or 'Submit' button to complete the CAPTCHA",
-                                detection_sensitivity=detection_sensitivity
-                            )
-                            
-                            # Add verify button click status and coordinate details to result
-                            result["verify_button_clicked"] = verify_result.get("success", False)
-                            result["click_details"] = {
-                                "coordinates_clicked": len(processed_coordinates),
-                                "dpi_scaling_applied": dpi_scaling,
-                                "window_offset_applied": bool(window_bounds),
-                                "processed_coordinates": processed_coordinates
-                            }
-                            
-                            if self.verbose:
-                                if result["verify_button_clicked"]:
-                                    print("Successfully clicked verify button")
-                                else:
-                                    print("Failed to click verify button")
                     
                     return result
                     
