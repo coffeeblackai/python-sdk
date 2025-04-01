@@ -1,5 +1,8 @@
 from dataclasses import dataclass
-from typing import Optional, List, Any, Dict
+from typing import Optional, List, Any, Dict, Union
+import json
+import csv
+import io
 
 @dataclass
 class BoundingBox:
@@ -74,4 +77,67 @@ class UIElement:
     class_name: str
     confidence: float
     type: str
-    children: Optional[List['UIElement']] = None 
+    children: Optional[List['UIElement']] = None
+
+class ExtractResponse:
+    """
+    Response object for HTML extraction that supports chaining format conversions.
+    """
+    def __init__(self, data: Dict[str, Any]):
+        self._data = data
+        self._raw_response = data.get('response', {})
+        self._format = data.get('format', 'json')
+        self._query = data.get('query', '')
+        self._processing_time = data.get('processing_time', 0)
+
+    @property
+    def data(self) -> Dict[str, Any]:
+        """Get the raw data from the response"""
+        return self._data
+
+    def json(self) -> Dict[str, Any]:
+        """Return the data as a JSON object"""
+        if isinstance(self._data.get('data'), str):
+            return json.loads(self._data['data'])
+        return self._data.get('data', {})
+
+    def csv(self, delimiter: str = ',') -> str:
+        """
+        Convert the data to CSV format.
+        
+        Args:
+            delimiter: The delimiter to use for CSV formatting (default: ',')
+            
+        Returns:
+            String containing the CSV data
+        """
+        data = self.json()
+        if not isinstance(data, list):
+            data = [data]
+            
+        if not data:
+            return ""
+            
+        # Get all unique keys from all objects
+        fieldnames = set()
+        for item in data:
+            if isinstance(item, dict):
+                fieldnames.update(item.keys())
+                
+        fieldnames = sorted(list(fieldnames))
+        
+        # Write to CSV string
+        output = io.StringIO()
+        writer = csv.DictWriter(output, fieldnames=fieldnames, delimiter=delimiter)
+        writer.writeheader()
+        writer.writerows(data)
+        
+        return output.getvalue()
+
+    def __str__(self) -> str:
+        """Return a string representation of the data"""
+        return str(self._data)
+
+    def __repr__(self) -> str:
+        """Return a detailed string representation"""
+        return f"ExtractResponse(format={self._format}, query='{self._query}', processing_time={self._processing_time}s)" 

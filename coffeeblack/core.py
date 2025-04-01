@@ -10,12 +10,14 @@ import pyautogui
 import asyncio
 import aiohttp
 import traceback
+import base64
 from typing import List, Dict, Optional, Any, Tuple, Callable, TypeVar, Union
 
-from .types import WindowInfo, Action, CoffeeBlackResponse
+from .types import WindowInfo, Action, CoffeeBlackResponse, ExtractResponse
 from .utils import debug, window, screenshot
 from .utils.app_manager import AppManager
 from .tasks import TaskManager
+from .extract import HTMLExtractor
 
 # Configure logging
 import logging
@@ -137,6 +139,14 @@ class CoffeeBlackSDK:
         # Retry settings
         self.max_retries = max_retries
         self.retry_backoff = retry_backoff
+        
+        # Initialize HTML extractor
+        self.html_extractor = HTMLExtractor(
+            base_url=base_url,
+            api_key=api_key,
+            debug_enabled=debug_enabled,
+            debug_dir=debug_dir
+        )
     
     async def get_open_windows(self) -> List[WindowInfo]:
         """
@@ -298,7 +308,8 @@ class CoffeeBlackSDK:
                            elements: Optional[str] = None,
                            skip_image_for_static: Optional[bool] = None,
                            temperature: Optional[float] = None,
-                           device_type: Optional[str] = None) -> CoffeeBlackResponse:
+                           device_type: Optional[str] = None,
+                           execute: bool = True) -> CoffeeBlackResponse:
         """
         Execute a natural language query on the API and optionally execute the chosen action.
         
@@ -316,6 +327,7 @@ class CoffeeBlackSDK:
             skip_image_for_static: Optional boolean to skip image processing for static commands
             temperature: Optional temperature parameter for UI-TARS/CUA models (0.0-1.0)
             device_type: Optional device type ("desktop" or "mobile")
+            execute: If True (default), execute the chosen action (click, type, etc.). If False, return the analysis without executing the action.
             
         Returns:
             CoffeeBlackResponse with the API response
@@ -580,8 +592,8 @@ class CoffeeBlackSDK:
                         timings=result.get("timings")
                     )
                     
-                    # Execute the action
-                    if response.chosen_action and response.chosen_element_index is not None and response.chosen_element_index >= 0:
+                    # Execute the action only if execute=True
+                    if execute and response.chosen_action and response.chosen_element_index is not None and response.chosen_element_index >= 0:
                         try:
                             chosen_box = response.boxes[response.chosen_element_index]
                             action = response.chosen_action
@@ -842,7 +854,16 @@ class CoffeeBlackSDK:
                                 print(f"Unsupported action: {action.action}")
                                 
                         except Exception as e:
-                            raise RuntimeError(f"Failed to execute action: {e}")
+                            # Log the error but don't necessarily raise it if we only failed execution
+                            # The reasoning part might still be valuable
+                            error_message = f"Failed to execute action: {e}"
+                            logger.error(error_message)
+                            # Optionally, add the execution error to the response object
+                            if not hasattr(response, 'execution_error'):
+                                response.execution_error = error_message
+                            # Depending on desired behavior, you might re-raise or just return the response
+                            # Re-raising for now to keep original behavior on execution failure
+                            raise RuntimeError(error_message)
                     
                     return response
                     
@@ -2557,3 +2578,26 @@ If the element IS NOT VISIBLE:
                 print(f"Warning: {error_msg}")
             raise RuntimeError(error_msg) from e
             
+    async def extract_html(self,
+                          html: str,
+                          query: str,
+                          output_format: str = "json",
+                          schema: Optional[Dict[str, Any]] = None) -> ExtractResponse:
+        """
+        Extract structured data from HTML based on a natural language query.
+        The HTML content will be automatically base64 encoded before sending to the API.
+        
+        Args:
+            html: The raw HTML content to extract data from
+            query: Natural language query describing what data to extract
+            output_format: Format for the output data ("json" or "csv")
+            schema: Optional schema defining the expected structure of the output data
+        
+        Returns:
+            ExtractResponse object that supports chaining format conversions
+        
+        Raises:
+            ValueError: If output_format is invalid
+            RuntimeError: If the API request fails
+        """
+        return await self.html_extractor.extract(html, query, output_format, schema)
